@@ -23,7 +23,12 @@ authors = [
     { name = "Brian Tkatch" }
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # Below 2: the server uses the decorator API (`@app.list_prompts()` and
+    # friends) that mcp 2.x removed, so an unpinned install fails at import.
+    # 1.8 is the first release with the Streamable HTTP session manager.
+    "mcp>=1.8,<2",
+    "starlette",
+    "uvicorn",
     "paprika-recipes @ git+https://github.com/briantkatch/paprika-recipes@2.5.2",
 ]
 
@@ -34,6 +39,8 @@ dev = [
     "ruff>=0.6.0",
     "mypy>=1.11.0",
     "pyupgrade>=3.17.0",
+    "pytest>=8.0.0",
+    "httpx",
 ]
 
 [project.scripts]

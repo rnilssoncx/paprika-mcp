@@ -54,6 +54,10 @@ def main():
     """Main CLI entry point."""
     if len(sys.argv) > 1 and sys.argv[1] == "setup":
         setup_credentials()
+    elif len(sys.argv) > 1 and sys.argv[1] == "http":
+        from paprika_mcp.http import run
+
+        run()
     else:
         # Start the server
         from paprika_mcp.server import run
