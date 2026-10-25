@@ -15,15 +15,20 @@ are tested without the API; the tool handlers only fetch, call them and post.
 
 import gzip
 import json
+import re
 import uuid
 from datetime import date, timedelta
 from typing import Any
 
 from mcp.types import TextContent
+from paprika_recipes.exceptions import RequestError
 
 from ..utils import get_remote
 
 MAX_DAYS = 62
+NOT_FOUND = "Recipe not found."
+# Paprika ids are hex groups joined by hyphens, longer than a plain UUID.
+RECIPE_ID = re.compile(r"[0-9A-Fa-f]+(-[0-9A-Fa-f]+){1,9}")
 
 
 class Refused(Exception):
@@ -186,10 +191,20 @@ def _post_meals(remote, meals: list[dict]) -> None:
 
 
 def _recipe_name(remote, recipe_id: str) -> str:
+    # The id goes into the request path, so it must look like an id first.
+    if not RECIPE_ID.fullmatch(recipe_id):
+        raise Refused(f'Not a recipe id: "{recipe_id}". Use search_recipes to find it.')
     try:
         recipe = remote._request("get", f"/api/v2/sync/recipe/{recipe_id}/").json().get("result") or {}
-    except Exception:
+    except RequestError as error:
+        # Paprika answers an unknown id with this exact error. Anything else —
+        # a timeout, a 5xx, a refused login — says nothing about whether the
+        # recipe exists, so it must not be reported as "no such recipe".
+        if str(error) != NOT_FOUND:
+            raise Refused(f'Could not look up recipe "{recipe_id}" in Paprika ({error}); nothing added.') from None
         recipe = {}
+    except Exception as error:
+        raise Refused(f'Could not reach Paprika to look up recipe "{recipe_id}"; nothing added. ({type(error).__name__})') from None
     if not recipe.get("name") or recipe.get("in_trash"):
         raise Refused(f'No recipe with id "{recipe_id}". Use search_recipes to find it.')
     return recipe["name"]
