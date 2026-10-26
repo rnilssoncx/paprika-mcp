@@ -243,3 +243,23 @@ def test_an_id_that_is_not_an_id_is_not_cached(tmp_path):
     cache.store_in_cache("../escape", "h1", {"name": "x"})
     cache.save()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["index.json"]
+
+
+# ---- accents: nobody types them ----
+
+ONION = RemoteRecipe(uid="C3-0C", name="Crème Brûlée", ingredients="1 cup shredded Gruyère", directions="Bake.", notes="", categories=[])
+
+
+def test_a_plain_search_without_the_accent_finds_the_accented_word(monkeypatch):
+    text = search(RecipeRemote([ONION, SOUP], [SOUPS]), monkeypatch, query="gruyere", fields=["ingredients"])
+    assert text.startswith("Found 1 recipes with 1 total matches for 'gruyere'")
+
+
+def test_a_regex_without_the_accent_finds_the_accented_word(monkeypatch):
+    text = search(RecipeRemote([ONION, SOUP], [SOUPS]), monkeypatch, query="gruyere|emmental", regex=True, fields=["ingredients"])
+    assert text.startswith("Found 1 recipes")
+
+
+def test_a_title_typed_without_accents_reads_the_recipe(monkeypatch):
+    text = read(RecipeRemote([ONION]), monkeypatch, title="creme brulee", fields=["ingredients"])
+    assert text == "# Crème Brûlée\n\n**UID:** C3-0C\n\n## Ingredients\n1 cup shredded Gruyère"

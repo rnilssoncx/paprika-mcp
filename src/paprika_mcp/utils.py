@@ -329,13 +329,27 @@ def compile_pattern(query: str) -> re.Pattern:
         raise ValueError(f"Error: Invalid regex pattern '{query}': {e}") from None
 
 
-def normalize_string(text: str) -> str:
-    """Normalize unicode string for comparison.
+def fold(text: str) -> str:
+    """Text as a search compares it: without accents, case-folded.
 
-    Uses NFD normalization to decompose accented characters,
-    making comparisons work across different unicode representations.
+    Recipes are clipped from the web with their accents ("Gruyère", "crème
+    fraîche") and nobody types them, Claude included, so an exact comparison
+    answered "No recipes found" for gruyere while the French Onion Soup called
+    for it. Decomposing (NFKD) and dropping the combining marks folds é to e
+    and leaves letters without one alone; folding is per character, so line
+    numbers and context are unaffected.
     """
-    return unicodedata.normalize("NFD", text).lower()
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
+
+
+def normalize_string(text: str) -> str:
+    """Normalize a title for comparison, ignoring accents and case (see fold).
+
+    Two live recipes whose titles fold to the same string are refused as
+    ambiguous by read_recipe, so ignoring accents cannot pick one silently.
+    """
+    return fold(text)
 
 
 def search_in_text(
@@ -362,7 +376,9 @@ def search_in_text(
     if regex:
         pattern = query if isinstance(query, re.Pattern) else compile_pattern(query)
         for i, line in enumerate(lines):
-            if pattern.search(line):
+            # Tried on the folded line as well, so 'gruyere|emmental' finds
+            # "Gruyère" without the pattern having to spell the accent.
+            if pattern.search(line) or pattern.search(fold(line)):
                 # Get context lines before and after
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
@@ -372,9 +388,9 @@ def search_in_text(
                     {"line": i + 1, "match": line.strip(), "context": context}
                 )
     else:
-        query_lower = query.lower()
+        query_folded = fold(query)
         for i, line in enumerate(lines):
-            if query_lower in line.lower():
+            if query_folded in fold(line):
                 # Get context lines before and after
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
