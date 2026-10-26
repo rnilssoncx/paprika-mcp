@@ -27,6 +27,8 @@ dependencies = [
     # friends) that mcp 2.x removed, so an unpinned install fails at import.
     # 1.8 is the first release with the Streamable HTTP session manager.
     "mcp>=1.8,<2",
+    # Imported directly: tool handlers run on anyio worker threads (server.py).
+    "anyio>=4",
     "starlette",
     "uvicorn",
     "paprika-recipes @ git+https://github.com/briantkatch/paprika-recipes@2.5.2",

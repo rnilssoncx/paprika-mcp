@@ -22,3 +22,24 @@ jobs:
 
       - name: Run ruff format
         run: ruff format --check .
+
+  run-tests:
+    # Its own job, so a failing lint step (the format check, say) does not skip
+    # the tests, and a red test is never hidden behind one.
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install the package and its dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: python -m pytest -q

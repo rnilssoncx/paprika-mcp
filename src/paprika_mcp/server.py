@@ -3,6 +3,7 @@
 import asyncio
 import logging
 
+import anyio.to_thread
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Prompt, Tool
@@ -38,10 +39,20 @@ async def list_tools():
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
-    """Handle tool calls."""
+    """Handle tool calls, each on a worker thread.
+
+    The handlers are synchronous because everything they do blocks: the
+    Paprika client is `requests`, with a 30 s timeout and three retries with
+    backoff (a minute or two before it gives up), and a cold recipe cache is a
+    GET per recipe. Called inline on the event loop, one such call froze every
+    other request the server was handling — another member's conversation, a
+    tools/list, the HTTP transport itself. On a worker thread only the caller
+    waits. Concurrent calls share the recipe cache directory, which is why
+    `utils._SharedDirectoryCache` writes atomically.
+    """
     if name in TOOLS:
         try:
-            return await TOOLS[name]["handler"](arguments)
+            return await anyio.to_thread.run_sync(TOOLS[name]["handler"], arguments)
         except Exception as e:
             logger.error(f"Error in {name}: {e}", exc_info=True)
             from mcp.types import TextContent

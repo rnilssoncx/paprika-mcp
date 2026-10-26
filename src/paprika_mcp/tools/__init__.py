@@ -3,6 +3,7 @@
 from .format_fraction import TOOL_DEFINITION as FORMAT_FRACTION_DEF
 from .format_fraction import format_fraction_tool
 from .list_categories import TOOL_DEFINITION as LIST_CATEGORIES_DEF
+from .list_categories import list_categories_tool
 from .meal_plan import (
     ADD_MEAL_DEF,
     LIST_MEALS_DEF,
@@ -15,7 +16,6 @@ from .meal_plan import (
     plan_menu_tool,
     remove_meal_tool,
 )
-from .list_categories import list_categories_tool
 from .read_recipe import TOOL_DEFINITION as READ_RECIPE_DEF
 from .read_recipe import read_recipe_tool
 from .search_recipes import TOOL_DEFINITION as SEARCH_RECIPES_DEF

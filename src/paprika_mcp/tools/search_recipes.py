@@ -4,10 +4,21 @@ from typing import Any
 
 from mcp.types import TextContent
 
-from ..utils import get_categories, get_remote, search_in_text, translate_category_uids
+from ..utils import (
+    CategoriesUnavailable,
+    compile_pattern,
+    get_categories,
+    get_remote,
+    search_in_text,
+    translate_category_uids,
+)
 
 
-async def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
+def _text(message: str) -> list[TextContent]:
+    return [TextContent(type="text", text=message)]
+
+
+def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
     """Search recipes by text across multiple fields."""
     query = args["query"]
     fields = args.get("fields", None)
@@ -17,6 +28,23 @@ async def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
     regex = args.get("regex", False)
     category_filter = args.get("category", None)
 
+    # Checked here, before any request: page_size 0 divides by zero below, and
+    # page 0 or less slices from the end of the results.
+    if not isinstance(page, int) or page < 1:
+        return _text(f"Error: page must be a whole number of 1 or more, got {page!r}.")
+    if not isinstance(page_size, int) or page_size < 1:
+        return _text(f"Error: page_size must be a whole number of 1 or more, got {page_size!r}.")
+
+    # Compiled once, up front. An invalid pattern used to match nothing and come
+    # back as "No recipes found matching ..." — a confident answer to a
+    # question that was never asked.
+    pattern = None
+    if regex and query:
+        try:
+            pattern = compile_pattern(query)
+        except ValueError as e:
+            return _text(str(e))
+
     # Get the remote
     remote = get_remote()
 
@@ -24,29 +52,32 @@ async def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
     all_recipes = [r for r in remote.recipes if not r.in_trash]
     all_recipes.sort(key=lambda r: r.name.lower())
 
-    # Get category mappings for translating UUIDs to names
-    categories_data = get_categories(remote.bearer_token)
-    category_name_to_uid = categories_data["name_to_uid"]
+    # Categories are fetched once per call (see get_categories), and a failure
+    # is an answer of its own: without the map, neither a category filter nor
+    # a search of category names can say "none", only "could not look".
+    try:
+        categories_data = get_categories(remote)
+    except CategoriesUnavailable as e:
+        return _text(f"Error: {e}, so the search was not run.")
+    uid_to_name = categories_data["uid_to_name"]
+
+    # "No such category" is a different answer from "no recipes in it": the
+    # first means the name is wrong (or the category is new and the map stale,
+    # which per-call fetching rules out), the second that the category is empty.
+    category_uid = None
+    if category_filter:
+        category_uid = categories_data["name_to_uid"].get(category_filter.lower())
+        if category_uid is None:
+            return _text(f"Error: No category named '{category_filter}'. Use list_categories to see the categories.")
 
     results = []
 
     for recipe in all_recipes:
-        # Filter by category if specified
-        if category_filter:
-            # Try to match by category name (case-insensitive)
-            category_uid = category_name_to_uid.get(category_filter.lower())
-            if category_uid:
-                # Match by resolved UID
-                if category_uid not in (recipe.categories or []):
-                    continue
-            else:
-                # No matching category name found, skip this recipe
-                continue
+        if category_uid and category_uid not in (recipe.categories or []):
+            continue
 
         # Translate category UUIDs to names for searching
-        category_names = translate_category_uids(
-            recipe.categories or [], remote.bearer_token
-        )
+        category_names = translate_category_uids(recipe.categories or [], uid_to_name)
 
         # Determine which fields to search
         searchable_fields = {
@@ -80,7 +111,7 @@ async def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
             if not field_text:
                 continue
 
-            matches = search_in_text(field_text, query, context_lines, regex=regex)
+            matches = search_in_text(field_text, pattern if regex else query, context_lines, regex=regex)
             if matches:
                 results.append(
                     {
@@ -165,7 +196,7 @@ TOOL_DEFINITION = {
             "regex": {
                 "type": "boolean",
                 "description": (
-                    "If true, treat query as a regex pattern. "
+                    "If true, treat query as a regex pattern (at most 200 characters). "
                     "Useful for matching singular/plural: 'cherr(y|ies)', 'bananas?', 'tomat(o|oes)'. "
                     "Default: false"
                 ),
@@ -202,11 +233,13 @@ TOOL_DEFINITION = {
                 "type": "integer",
                 "description": "Page number for pagination (default: 1)",
                 "default": 1,
+                "minimum": 1,
             },
             "page_size": {
                 "type": "integer",
                 "description": "Number of results per page (default: 20)",
                 "default": 20,
+                "minimum": 1,
             },
         },
         "required": ["query"],

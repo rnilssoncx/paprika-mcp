@@ -61,3 +61,25 @@ def test_the_server_binds_to_localhost_by_default(monkeypatch):
     monkeypatch.setattr(http.uvicorn, "run", lambda app, host, port: seen.update(host=host))
     http.run()
     assert seen["host"] == "127.0.0.1"
+
+
+def test_the_token_with_a_suffix_is_refused(client):
+    # A comparison that checks only that the header starts with the token
+    # would let this through.
+    assert post(client, f"Bearer {TOKEN}x").status_code == 401
+
+
+def test_a_31_character_token_will_not_start_the_server(monkeypatch):
+    monkeypatch.setenv("PAPRIKA_MCP_TOKEN", "t" * 31)
+    monkeypatch.setattr(http.uvicorn, "run", lambda *a, **k: pytest.fail("server started"))
+    with pytest.raises(SystemExit) as stopped:
+        http.run()
+    assert str(stopped.value) == "PAPRIKA_MCP_TOKEN must be set to a random value of at least 32 characters."
+
+
+def test_a_32_character_token_starts_the_server(monkeypatch):
+    started = []
+    monkeypatch.setenv("PAPRIKA_MCP_TOKEN", "t" * 32)
+    monkeypatch.setattr(http.uvicorn, "run", lambda app, host, port: started.append(port))
+    http.run()
+    assert started

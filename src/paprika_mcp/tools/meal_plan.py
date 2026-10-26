@@ -23,7 +23,7 @@ from typing import Any
 from mcp.types import TextContent
 from paprika_recipes.exceptions import RequestError
 
-from ..utils import get_remote
+from ..utils import get_remote, notify_apps
 
 MAX_DAYS = 62
 NOT_FOUND = "Recipe not found."
@@ -58,9 +58,22 @@ def resolve_meal_type(types: list[dict], name: str) -> dict:
 
 
 def find_menu(menus: list[dict], name: str) -> dict:
+    """The menu with this name, or this id.
+
+    Two menus may share a name, and planning the first would put the wrong
+    week on the planner with nothing to say a choice was made. So an ambiguous
+    name is refused with the candidates' ids, and an id is accepted — that is
+    the only way to name one of two menus called the same thing.
+    """
     for m in menus:
-        if m["name"].lower() == name.strip().lower():
+        if m["uid"] == name.strip():
             return m
+    named = [m for m in menus if m["name"].lower() == name.strip().lower()]
+    if len(named) > 1:
+        which = ", ".join(f'{m["uid"]} ({m.get("days") or 1} day{"s" if (m.get("days") or 1) != 1 else ""})' for m in named)
+        raise Refused(f'{len(named)} menus are named "{name}": {which}. Give plan_menu the id of the one you mean.')
+    if named:
+        return named[0]
     known = ", ".join(m["name"] for m in menus) or "none"
     raise Refused(f'No menu named "{name}". Menus: {known}')
 
@@ -184,10 +197,16 @@ def _get(remote, collection: str) -> list[dict]:
     return remote._request("get", f"/api/v2/sync/{collection}/").json().get("result", [])
 
 
-def _post_meals(remote, meals: list[dict]) -> None:
+def _post_meals(remote, meals: list[dict]) -> str:
+    """Write meals, then ask Paprika to tell the apps.
+
+    Returns "" or a sentence to append to the answer. A notify that fails after
+    the POST succeeded must not surface as "Error": the meals are written, and
+    a member told otherwise will add them again.
+    """
     body = gzip.compress(json.dumps(meals).encode())
     remote._request("post", "/api/v2/sync/meals/", files={"data": ("data", body)})
-    remote.notify()
+    return notify_apps(remote)
 
 
 def _recipe_name(remote, recipe_id: str) -> str:
@@ -215,9 +234,9 @@ def _text(message: str) -> list[TextContent]:
 
 
 def _refusable(handler):
-    async def run(args: dict[str, Any]) -> list[TextContent]:
+    def run(args: dict[str, Any]) -> list[TextContent]:
         try:
-            return await handler(args)
+            return handler(args)
         except Refused as r:
             return _text(str(r))
 
@@ -225,7 +244,7 @@ def _refusable(handler):
 
 
 @_refusable
-async def list_meals_tool(args: dict[str, Any]) -> list[TextContent]:
+def list_meals_tool(args: dict[str, Any]) -> list[TextContent]:
     start = parse_date(args["start_date"]) if args.get("start_date") else date.today()
     days = int(args.get("days", 7))
     if not 1 <= days <= MAX_DAYS:
@@ -235,7 +254,7 @@ async def list_meals_tool(args: dict[str, Any]) -> list[TextContent]:
 
 
 @_refusable
-async def add_meal_tool(args: dict[str, Any]) -> list[TextContent]:
+def add_meal_tool(args: dict[str, Any]) -> list[TextContent]:
     day = parse_date(args.get("date"))
     recipe_id, name = args.get("recipe_id"), (args.get("name") or "").strip()
     if not recipe_id and not name:
@@ -245,37 +264,36 @@ async def add_meal_tool(args: dict[str, Any]) -> list[TextContent]:
     if recipe_id:
         name = _recipe_name(remote, recipe_id)
     meal = decide_add(_get(remote, "meals"), day, meal_type, name, recipe_id)
-    _post_meals(remote, [meal])
-    return _text(f"Planned {name} for {meal_type['name']} on {day.strftime('%A')} {day.isoformat()} (meal id {meal['uid']}).")
+    note = _post_meals(remote, [meal])
+    return _text(f"Planned {name} for {meal_type['name']} on {day.strftime('%A')} {day.isoformat()} (meal id {meal['uid']}).{note}")
 
 
 @_refusable
-async def remove_meal_tool(args: dict[str, Any]) -> list[TextContent]:
+def remove_meal_tool(args: dict[str, Any]) -> list[TextContent]:
     remote = get_remote()
     meal = decide_remove(_get(remote, "meals"), args.get("meal_id", ""))
-    _post_meals(remote, [meal])
-    return _text(f"Removed {meal['name']} from {meal['date'][:10]}.")
+    note = _post_meals(remote, [meal])
+    return _text(f"Removed {meal['name']} from {meal['date'][:10]}.{note}")
 
 
 @_refusable
-async def list_menus_tool(args: dict[str, Any]) -> list[TextContent]:
+def list_menus_tool(args: dict[str, Any]) -> list[TextContent]:
     remote = get_remote()
     return _text(format_menus(_get(remote, "menus"), _get(remote, "menuitems"), _get(remote, "mealtypes")))
 
 
 @_refusable
-async def plan_menu_tool(args: dict[str, Any]) -> list[TextContent]:
+def plan_menu_tool(args: dict[str, Any]) -> list[TextContent]:
     start = parse_date(args.get("start_date"))
     remote = get_remote()
     menu = find_menu(_get(remote, "menus"), args.get("menu", ""))
     to_add, skipped = decide_plan_menu(menu, _get(remote, "menuitems"), start, _get(remote, "mealtypes"), _get(remote, "meals"))
-    if to_add:
-        _post_meals(remote, to_add)
+    note = _post_meals(remote, to_add) if to_add else ""
     lines = [f'Planned {len(to_add)} meal(s) from "{menu["name"]}" starting {start.isoformat()}:']
     lines += [f"- {m['date'][:10]}: {m['name']} (meal id {m['uid']})" for m in to_add]
     if skipped:
         lines.append(f"Already planned, skipped: {', '.join(m['name'] for m in skipped)}")
-    return _text("\n".join(lines))
+    return _text("\n".join(lines) + note)
 
 
 # ---- definitions ---------------------------------------------------------------------
@@ -339,7 +357,7 @@ PLAN_MENU_DEF = {
     "inputSchema": {
         "type": "object",
         "properties": {
-            "menu": {"type": "string", "description": "The menu's name, as list_menus shows it."},
+            "menu": {"type": "string", "description": "The menu's name, as list_menus shows it, or its id when two menus share a name."},
             "start_date": {"type": "string", "description": "YYYY-MM-DD for the menu's day 1."},
         },
         "required": ["menu", "start_date"],

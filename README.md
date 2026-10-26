@@ -192,7 +192,7 @@ Read full recipe data by ID or title.
 **Parameters:**
 - `id` or `title` (one required): Recipe UUID or exact recipe name
 
-**Note:** Title matching uses Unicode normalization (NFD), so it works correctly with accented characters regardless of their unicode representation (e.g., "café" will match "café").
+**Note:** Title matching uses Unicode normalization (NFD), so it works correctly with accented characters regardless of their unicode representation (e.g., "café" will match "café"). Recipes in the trash are skipped, and if two live recipes share the title the tool lists their ids instead of picking one.
 
 **Example:**
 ```json
@@ -238,6 +238,8 @@ Update a recipe field using find/replace.
 - `find` (required): Text to find
 - `replace` (required): Text to replace with
 - `regex` (optional): Treat find pattern as regex (default: false)
+
+An empty `find`, or a regex that can match empty text, is refused on a field that already has text (it would insert the replacement between every character); on an empty field, `find: ""` sets it. To replace a whole field, use `regex: true` with `find: "(?s).+"`. For `rating`, `find` is ignored and `replace` is the new rating, 0 to 5. After a successful edit the apps are notified, as the meal planner tools do.
 
 **Example:**
 ```json

@@ -1,7 +1,6 @@
 """Meal planner and menus: the decisions are tested by hand, the handlers against
 a fake remote that records what would have been sent to Paprika."""
 
-import asyncio
 import gzip
 import json
 import re
@@ -158,6 +157,7 @@ class FakeRemote:
         self.recipes = recipes or {}
         self.posted, self.notified = [], 0
         self.recipe_gets, self.recipe_error = [], None
+        self.notify_error = None
 
     def _request(self, method, path, **kwargs):
         if method == "post":
@@ -177,6 +177,8 @@ class FakeRemote:
         return Response({"result": self.data[path.split("/")[-2]]})
 
     def notify(self):
+        if self.notify_error:
+            raise self.notify_error
         self.notified += 1
 
 
@@ -190,7 +192,7 @@ class Response:
 
 def run(tool, args, remote, monkeypatch):
     monkeypatch.setattr(mp, "get_remote", lambda: remote)
-    return asyncio.run(TOOLS[tool]["handler"](args))[0].text
+    return TOOLS[tool]["handler"](args)[0].text
 
 
 def test_the_five_tools_are_registered():
@@ -311,3 +313,110 @@ def test_list_meals_refuses_a_range_out_of_bounds(monkeypatch, days):
 def test_list_menus_shows_the_menus(monkeypatch):
     text = run("list_menus", {}, FakeRemote(), monkeypatch)
     assert text.startswith("2 menu(s):") and "## Feast (2 days)" in text and "## Other (1 day)" in text
+
+
+# ---- what a write sends: only the meal it is about ----
+#
+# Paprika's meals endpoint takes a batch, and a meal in the batch marked
+# deleted is deleted. So a handler that posts more than its one meal can wipe
+# the planner, and the fixtures below always hold several meals: with one
+# meal, "post the target" and "post everything" are the same request.
+
+
+def test_remove_meal_posts_only_the_meal_removed(monkeypatch):
+    others = [meal("A", "2026-10-25", LUNCH, "Soup"), meal("C", "2026-10-27", BREAKFAST, "Toast")]
+    target = meal("B", "2026-10-26", DINNER, "Roast", "A1-0A")
+    remote = FakeRemote(meals=[others[0], target, others[1]])
+    run("remove_meal", {"meal_id": "B"}, remote, monkeypatch)
+    assert remote.posted == [[{**target, "deleted": True}]]
+
+
+def test_add_meal_posts_only_the_new_meal(monkeypatch):
+    existing = [meal("A", "2026-10-25", LUNCH, "Soup"), meal("B", "2026-10-26", BREAKFAST, "Toast")]
+    remote = FakeRemote(meals=existing)
+    run("add_meal", {"date": "2026-10-26", "name": "Takeout"}, remote, monkeypatch)
+    [batch] = remote.posted
+    assert [(m["name"], m.get("deleted")) for m in batch] == [("Takeout", False)]
+
+
+# ---- text-only meals ----
+
+
+def test_two_different_text_only_meals_share_a_slot():
+    # With no recipe on either side, recipe_uid is None == None; the dish is the name.
+    existing = [meal("A", "2026-10-26", DINNER, "Leftovers")]
+    assert mp.decide_add(existing, date(2026, 10, 26), DINNER, "Takeout", None)["name"] == "Takeout"
+
+
+def test_add_meal_plans_a_second_text_only_meal_in_a_slot(monkeypatch):
+    remote = FakeRemote(meals=[meal("A", "2026-10-26", DINNER, "Leftovers")])
+    text = run("add_meal", {"date": "2026-10-26", "name": "Takeout"}, remote, monkeypatch)
+    assert text.startswith("Planned Takeout for Dinner on Monday 2026-10-26 (meal id ")
+    assert [[m["name"] for m in batch] for batch in remote.posted] == [["Takeout"]]
+
+
+# ---- menus ----
+
+TWICE = {"uid": "M-TWICE", "name": "Twice", "notes": "", "order_flag": 2, "days": 1}
+TWICE_ITEMS = [
+    {"uid": "I4", "menu_uid": "M-TWICE", "name": "Stew", "recipe_uid": "D4-0D", "type_uid": "T-DIN", "day": 1, "order_flag": 0, "scale": None},
+    {"uid": "I5", "menu_uid": "M-TWICE", "name": "Stew", "recipe_uid": "D4-0D", "type_uid": "T-DIN", "day": 1, "order_flag": 1, "scale": None},
+]
+
+
+def test_a_dish_listed_twice_in_one_menu_slot_is_planned_once():
+    to_add, skipped = mp.decide_plan_menu(TWICE, TWICE_ITEMS, date(2026, 11, 2), TYPES, [])
+    assert [m["name"] for m in to_add] == ["Stew"]
+    assert [m["name"] for m in skipped] == ["Stew"]
+
+
+FEAST_TOO = {"uid": "M-FEAST2", "name": "feast", "notes": "", "order_flag": 3, "days": 1}
+
+
+def test_an_ambiguous_menu_name_is_refused_with_the_ids():
+    with pytest.raises(mp.Refused) as refused:
+        mp.find_menu([FEAST, OTHER, FEAST_TOO], "Feast")
+    assert str(refused.value) == '2 menus are named "Feast": M-FEAST (2 days), M-FEAST2 (1 day). Give plan_menu the id of the one you mean.'
+
+
+def test_a_menu_can_be_named_by_its_id():
+    assert mp.find_menu([FEAST, OTHER, FEAST_TOO], "M-FEAST2") is FEAST_TOO
+
+
+def test_plan_menu_with_an_ambiguous_name_posts_nothing(monkeypatch):
+    remote = FakeRemote()
+    remote.data["menus"] = [FEAST, OTHER, FEAST_TOO]
+    text = run("plan_menu", {"menu": "Feast", "start_date": "2026-12-24"}, remote, monkeypatch)
+    assert text.startswith('2 menus are named "Feast"')
+    assert remote.posted == []
+
+
+# ---- a failed notify after a successful write ----
+
+NOTIFY_NOTE = (
+    "\n\nThe change is saved in Paprika, but the apps could not be told to refresh "
+    "(ConnectionError: reset); they will show it at their next sync."
+)
+
+
+def test_a_failed_notify_after_add_reports_the_meal_as_planned(monkeypatch):
+    remote = FakeRemote()
+    remote.notify_error = ConnectionError("reset")
+    text = run("add_meal", {"date": "2026-10-26", "name": "Takeout"}, remote, monkeypatch)
+    [[posted]] = remote.posted
+    assert text == f"Planned Takeout for Dinner on Monday 2026-10-26 (meal id {posted['uid']}).{NOTIFY_NOTE}"
+
+
+def test_a_failed_notify_after_remove_reports_the_meal_as_removed(monkeypatch):
+    remote = FakeRemote(meals=[meal("B", "2026-10-26", DINNER, "Roast", "A1-0A")])
+    remote.notify_error = ConnectionError("reset")
+    assert run("remove_meal", {"meal_id": "B"}, remote, monkeypatch) == f"Removed Roast from 2026-10-26.{NOTIFY_NOTE}"
+
+
+def test_a_failed_notify_after_plan_menu_reports_the_meals_as_planned(monkeypatch):
+    remote = FakeRemote()
+    remote.notify_error = ConnectionError("reset")
+    text = run("plan_menu", {"menu": "Other", "start_date": "2026-12-24"}, remote, monkeypatch)
+    assert text.startswith('Planned 1 meal(s) from "Other" starting 2026-12-24:')
+    assert text.endswith(NOTIFY_NOTE)
+    assert len(remote.posted) == 1

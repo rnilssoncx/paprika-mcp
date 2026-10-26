@@ -80,7 +80,7 @@ def format_fraction(fraction_str: str) -> str:
     return f"{superscript_num}{fraction_slash}{subscript_den}"
 
 
-async def format_fraction_tool(args: dict[str, Any]) -> list[TextContent]:
+def format_fraction_tool(args: dict[str, Any]) -> list[TextContent]:
     """Format a fraction to unicode."""
     fraction_str = args["fraction"]
 

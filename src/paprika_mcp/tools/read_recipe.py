@@ -4,10 +4,16 @@ from typing import Any
 
 from mcp.types import TextContent
 
-from ..utils import get_remote, normalize_string, translate_category_uids
+from ..utils import (
+    CategoriesUnavailable,
+    get_categories,
+    get_remote,
+    normalize_string,
+    translate_category_uids,
+)
 
 
-async def read_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
+def read_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
     """Read full recipe data by ID or exact title."""
     recipe_id = args.get("id")
     recipe_title = args.get("title")
@@ -37,34 +43,47 @@ async def read_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
                 )
             ]
     else:
-        # Search by title
-        # NOTE: This is not optimal - ideally we'd cache the recipe list
-        # and search through it, but for now we fetch all recipes
-        all_recipes = remote.recipes
-
-        # Normalize the search title
+        # Search by title, among recipes not in the trash. A trashed copy used
+        # to win if it came first, so the member read — and, with the uid this
+        # returns, then edited — the recipe in the trash rather than the live
+        # one. Two live recipes with one title are refused rather than picked
+        # between: whichever came first would be a guess the member never sees.
         normalized_search = normalize_string(recipe_title)
+        matches = [
+            r
+            for r in remote.recipes
+            if not r.in_trash and normalize_string(r.name) == normalized_search
+        ]
 
-        # Find matching recipe
-        recipe = None
-        for r in all_recipes:
-            if normalize_string(r.name) == normalized_search:
-                recipe = r
-                break
-
-        if not recipe:
+        if not matches:
             return [
                 TextContent(
                     type="text",
                     text=f"Error: No recipe found with title '{recipe_title}'",
                 )
             ]
+        if len(matches) > 1:
+            ids = ", ".join(r.uid for r in matches)
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {len(matches)} recipes are titled '{recipe_title}': {ids}. Read one by id.",
+                )
+            ]
+        recipe = matches[0]
 
     # Define all available fields and their formatters
-    # Translate category UUIDs to names
-    category_names = translate_category_uids(
-        recipe.categories or [], remote.bearer_token
-    )
+    # Translate category UUIDs to names — fetched only when the answer shows
+    # them, and a failed fetch is said in place rather than shown as
+    # `Unknown-xxxx` names or as no categories at all.
+    category_names = ""
+    wants_categories = not requested_fields or "categories" in requested_fields
+    if recipe.categories and wants_categories:
+        try:
+            uid_to_name = get_categories(remote)["uid_to_name"]
+            category_names = translate_category_uids(recipe.categories, uid_to_name)
+        except CategoriesUnavailable as e:
+            category_names = f"({e}.)"
 
     all_fields = {
         "name": lambda: [f"# {recipe.name}"],

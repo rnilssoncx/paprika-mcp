@@ -4,16 +4,19 @@ from typing import Any
 
 from mcp.types import TextContent
 
-from ..utils import get_categories, get_remote
+from ..utils import CategoriesUnavailable, get_categories, get_remote
 
 
-async def list_categories_tool(args: dict[str, Any]) -> list[TextContent]:
+def list_categories_tool(args: dict[str, Any]) -> list[TextContent]:
     """List all recipe categories with their names and hierarchical structure."""
-    # Get the remote to access bearer token
     remote = get_remote()
 
-    # Fetch categories using cached utility
-    categories_data = get_categories(remote.bearer_token)
+    # A failed fetch is an error, not "No categories found": the second is a
+    # statement about the account, and the request said nothing about it.
+    try:
+        categories_data = get_categories(remote)
+    except CategoriesUnavailable as e:
+        return [TextContent(type="text", text=f"Error: {e}.")]
     categories = categories_data["all"]
 
     if not categories:
