@@ -36,7 +36,8 @@ def search(remote, monkeypatch, **args):
 
 def test_an_invalid_regex_is_reported_as_invalid(monkeypatch):
     text = search(RecipeRemote([SOUP], [SOUPS]), monkeypatch, query="1/2 cup (", regex=True)
-    assert text == "Error: Invalid regex pattern '1/2 cup (': missing ), unterminated subpattern at position 8"
+    # `regex`'s wording since plans/012 § 4, not `re`'s: it is still the parser's own reason.
+    assert text == "Error: Invalid regex pattern '1/2 cup (': missing ) at position 9"
 
 
 def test_an_overlong_regex_is_refused(monkeypatch):

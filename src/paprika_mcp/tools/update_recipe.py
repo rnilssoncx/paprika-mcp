@@ -3,9 +3,19 @@
 import re
 from typing import Any
 
+import regex as regex_module
 from mcp.types import TextContent
 
-from ..utils import CategoriesUnavailable, get_categories, get_remote, notify_apps
+from ..utils import (
+    EDIT_TIMEOUT,
+    CategoriesUnavailable,
+    PatternTimeout,
+    UserPattern,
+    compile_pattern,
+    get_categories,
+    get_remote,
+    notify_apps,
+)
 
 # The text fields find/replace works on. Checked in the handler, not only in the
 # schema: the MCP library validates arguments against the schema, but that is a
@@ -37,13 +47,28 @@ EMPTY_MATCH = (
     "To append, find the field's last words and replace them with those words plus the addition. "
     "To set the whole field, use regex=true with find '(?s).+'."
 )
+# The find is compiled before the recipe is fetched, so an error from the
+# substitution is the replacement's: `\2` with one group, or `\g<qty>` naming
+# none (which `regex`, like `re`, raises as IndexError rather than its error).
+BAD_REPLACEMENT = "Error: Invalid replacement '{replace}': {error}. No changes were saved."
+# The most an edit may write into one field. A replacement is multiplied by
+# every match, so `(?s)(.+)` with `\1` repeated, or `.` with a long literal,
+# builds hundreds of megabytes from a request of a few hundred kilobytes —
+# within the match deadline, which bounds time, not size — and the whole value
+# is then uploaded and echoed back. Far above any real recipe field; a field
+# already longer than this can still be edited, as long as it does not grow.
+FIELD_LIMIT = 64_000
+TOO_LONG = (
+    "Error: That edit would make field '{field}' of recipe '{name}' {length} characters long; "
+    "an edit may write at most {limit}. No changes were saved."
+)
 
 
 def _text(message: str) -> list[TextContent]:
     return [TextContent(type="text", text=message)]
 
 
-def matches_empty(text: str, find: str, pattern: re.Pattern | None) -> bool:
+def matches_empty(text: str, find: str, pattern: UserPattern | None) -> bool:
     """Would replacing `find` in `text` insert at a zero-width match?
 
     `str.replace("", x)` and `re.sub` with a pattern that can match nothing
@@ -59,7 +84,7 @@ def matches_empty(text: str, find: str, pattern: re.Pattern | None) -> bool:
     return any(m.start() == m.end() for m in pattern.finditer(text))
 
 
-def _replace(text: str, find: str, replace: str, pattern: re.Pattern | None) -> str:
+def _replace(text: str, find: str, replace: str, pattern: UserPattern | None) -> str:
     return pattern.sub(replace, text) if pattern is not None else text.replace(find, replace)
 
 
@@ -82,12 +107,15 @@ def update_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
             return _text(BAD_RATING.format(replace=replace))
         new_rating = int(replace.strip())
 
+    # Through the same helper as search, for its cap and its deadline: this is
+    # the second place a member's pattern meets recipe text. Case-sensitive,
+    # as it always was here — an edit replaces exactly what it finds.
     pattern = None
     if use_regex and field != "rating":
         try:
-            pattern = re.compile(find)
-        except re.error as e:
-            return _text(f"Error: Invalid regex pattern '{find}': {str(e)}")
+            pattern = compile_pattern(find, ignore_case=False)
+        except ValueError as e:
+            return _text(str(e))
 
     # Get the remote
     remote = get_remote()
@@ -124,12 +152,17 @@ def update_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
             uid_to_name.get(uid, f"Unknown-{uid[:8]}") for uid in current_uids
         )
 
-        if matches_empty(current_names, find, pattern):
-            return _text(EMPTY_MATCH.format(find=find, field=field, name=recipe.name))
         try:
+            if matches_empty(current_names, find, pattern):
+                return _text(EMPTY_MATCH.format(find=find, field=field, name=recipe.name))
             new_names = _replace(current_names, find, replace, pattern)
-        except re.error as e:
-            return _text(f"Error: Invalid regex pattern '{find}': {str(e)}")
+        except PatternTimeout:
+            return _text(EDIT_TIMEOUT.format(title=recipe.name))
+        except (regex_module.error, IndexError) as e:
+            return _text(BAD_REPLACEMENT.format(replace=replace, error=e))
+
+        if len(new_names) > FIELD_LIMIT and len(new_names) > len(current_names):
+            return _text(TOO_LONG.format(field=field, name=recipe.name, length=len(new_names), limit=FIELD_LIMIT))
 
         # Collapse any double-newlines left after removal
         new_names = re.sub(r"\n{2,}", "\n", new_names).strip()
@@ -155,18 +188,23 @@ def update_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
     # A text field Paprika sent as null is empty, and an empty find fills it.
     field_value = getattr(recipe, field) or ""
 
-    if matches_empty(field_value, find, pattern):
-        return _text(EMPTY_MATCH.format(find=find, field=field, name=recipe.name))
-
-    # Perform the find/replace on string fields
+    # A timeout uploads nothing: it is caught before `setattr`, and it is not
+    # "No changes made", which would claim the pattern is absent from the field.
     try:
+        if matches_empty(field_value, find, pattern):
+            return _text(EMPTY_MATCH.format(find=find, field=field, name=recipe.name))
         new_value = _replace(field_value, find, replace, pattern)
-    except re.error as e:
-        return _text(f"Error: Invalid regex pattern '{find}': {str(e)}")
+    except PatternTimeout:
+        return _text(EDIT_TIMEOUT.format(title=recipe.name))
+    except (regex_module.error, IndexError) as e:
+        return _text(BAD_REPLACEMENT.format(replace=replace, error=e))
 
     # Check if anything changed
     if new_value == field_value:
         return _text(f"No changes made - pattern '{find}' not found in field '{field}' of recipe '{recipe.name}'")
+
+    if len(new_value) > FIELD_LIMIT and len(new_value) > len(field_value):
+        return _text(TOO_LONG.format(field=field, name=recipe.name, length=len(new_value), limit=FIELD_LIMIT))
 
     # Update the field
     setattr(recipe, field, new_value)

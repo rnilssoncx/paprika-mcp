@@ -5,10 +5,15 @@ from typing import Any
 from mcp.types import TextContent
 
 from ..utils import (
+    MAX_QUERY_LENGTH,
+    PLAIN_SEARCH_TIMEOUT,
+    SEARCH_TIMEOUT,
     CategoriesUnavailable,
+    PatternTimeout,
     compile_pattern,
     get_categories,
     get_remote,
+    literal_pattern,
     search_in_text,
     translate_category_uids,
 )
@@ -18,60 +23,10 @@ def _text(message: str) -> list[TextContent]:
     return [TextContent(type="text", text=message)]
 
 
-def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
-    """Search recipes by text across multiple fields."""
-    query = args["query"]
-    fields = args.get("fields", None)
-    context_lines = args.get("context_lines", 2)
-    page = args.get("page", 1)
-    page_size = args.get("page_size", 20)
-    regex = args.get("regex", False)
-    category_filter = args.get("category", None)
-
-    # Checked here, before any request: page_size 0 divides by zero below, and
-    # page 0 or less slices from the end of the results.
-    if not isinstance(page, int) or page < 1:
-        return _text(f"Error: page must be a whole number of 1 or more, got {page!r}.")
-    if not isinstance(page_size, int) or page_size < 1:
-        return _text(f"Error: page_size must be a whole number of 1 or more, got {page_size!r}.")
-
-    # Compiled once, up front. An invalid pattern used to match nothing and come
-    # back as "No recipes found matching ..." — a confident answer to a
-    # question that was never asked.
-    pattern = None
-    if regex and query:
-        try:
-            pattern = compile_pattern(query)
-        except ValueError as e:
-            return _text(str(e))
-
-    # Get the remote
-    remote = get_remote()
-
-    # Fetch all recipes (excluding trashed) and sort alphabetically
-    all_recipes = [r for r in remote.recipes if not r.in_trash]
-    all_recipes.sort(key=lambda r: r.name.lower())
-
-    # Categories are fetched once per call (see get_categories), and a failure
-    # is an answer of its own: without the map, neither a category filter nor
-    # a search of category names can say "none", only "could not look".
-    try:
-        categories_data = get_categories(remote)
-    except CategoriesUnavailable as e:
-        return _text(f"Error: {e}, so the search was not run.")
-    uid_to_name = categories_data["uid_to_name"]
-
-    # "No such category" is a different answer from "no recipes in it": the
-    # first means the name is wrong (or the category is new and the map stale,
-    # which per-call fetching rules out), the second that the category is empty.
-    category_uid = None
-    if category_filter:
-        category_uid = categories_data["name_to_uid"].get(category_filter.lower())
-        if category_uid is None:
-            return _text(f"Error: No category named '{category_filter}'. Use list_categories to see the categories.")
-
-    results = []
-
+def _search(all_recipes, uid_to_name, category_uid, fields, query, pattern, context_lines) -> list[dict[str, Any]]:
+    """Every match, in recipe order. Raises PatternTimeout from the first
+    match past the call's deadline: a partial list would read as a complete one."""
+    results: list[dict[str, Any]] = []
     for recipe in all_recipes:
         if category_uid and category_uid not in (recipe.categories or []):
             continue
@@ -111,7 +66,7 @@ def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
             if not field_text:
                 continue
 
-            matches = search_in_text(field_text, pattern if regex else query, context_lines, regex=regex)
+            matches = search_in_text(field_text, pattern, context_lines)
             if matches:
                 results.append(
                     {
@@ -121,8 +76,73 @@ def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
                         "matches": matches,
                     }
                 )
+    return results
+
+
+def search_recipes_tool(args: dict[str, Any]) -> list[TextContent]:
+    """Search recipes by text across multiple fields."""
+    query = args["query"]
+    fields = args.get("fields", None)
+    context_lines = args.get("context_lines", 2)
+    page = args.get("page", 1)
+    page_size = args.get("page_size", 20)
+    regex = args.get("regex", False)
+    category_filter = args.get("category", None)
+
+    # Checked here, before any request: page_size 0 divides by zero below, and
+    # page 0 or less slices from the end of the results.
+    if not isinstance(page, int) or page < 1:
+        return _text(f"Error: page must be a whole number of 1 or more, got {page!r}.")
+    if not isinstance(page_size, int) or page_size < 1:
+        return _text(f"Error: page_size must be a whole number of 1 or more, got {page_size!r}.")
+
+    # Compiled once, up front. An invalid pattern used to match nothing and come
+    # back as "No recipes found matching ..." — a confident answer to a
+    # question that was never asked. A plain query becomes a pattern too, so
+    # both kinds share one path and one deadline (utils.UserPattern).
+    pattern = None
+    if regex and query:
+        try:
+            pattern = compile_pattern(query)
+        except ValueError as e:
+            return _text(str(e))
+    elif query:
+        if len(query) > MAX_QUERY_LENGTH:
+            return _text(f"Error: Search text is {len(query)} characters; the limit is {MAX_QUERY_LENGTH}.")
+        pattern = literal_pattern(query)
+
+    # Get the remote
+    remote = get_remote()
+
+    # Fetch all recipes (excluding trashed) and sort alphabetically
+    all_recipes = [r for r in remote.recipes if not r.in_trash]
+    all_recipes.sort(key=lambda r: r.name.lower())
+
+    # Categories are fetched once per call (see get_categories), and a failure
+    # is an answer of its own: without the map, neither a category filter nor
+    # a search of category names can say "none", only "could not look".
+    try:
+        categories_data = get_categories(remote)
+    except CategoriesUnavailable as e:
+        return _text(f"Error: {e}, so the search was not run.")
+    uid_to_name = categories_data["uid_to_name"]
+
+    # "No such category" is a different answer from "no recipes in it": the
+    # first means the name is wrong (or the category is new and the map stale,
+    # which per-call fetching rules out), the second that the category is empty.
+    category_uid = None
+    if category_filter:
+        category_uid = categories_data["name_to_uid"].get(category_filter.lower())
+        if category_uid is None:
+            return _text(f"Error: No category named '{category_filter}'. Use list_categories to see the categories.")
+
+    try:
+        results = _search(all_recipes, uid_to_name, category_uid, fields, query, pattern, context_lines)
+    except PatternTimeout:
+        return _text(SEARCH_TIMEOUT if regex else PLAIN_SEARCH_TIMEOUT)
 
     if not results:
+
         query_text = query if query else "(empty query)"
         category_text = f" in category '{category_filter}'" if category_filter else ""
         return [

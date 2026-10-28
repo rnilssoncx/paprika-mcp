@@ -32,6 +32,9 @@ dependencies = [
     "starlette",
     "uvicorn",
     "paprika-recipes @ git+https://github.com/briantkatch/paprika-recipes@2.5.2",
+    # A member's pattern is matched with `regex`, not `re`, for its per-call
+    # timeout and for releasing the GIL while it matches (utils.UserPattern).
+    "regex>=2024.4.16",
 ]
 
 [project.optional-dependencies]
@@ -42,6 +45,7 @@ dev = [
     "mypy>=1.11.0",
     "pyupgrade>=3.17.0",
     "pytest>=8.0.0",
+    "pytest-timeout>=2.3",
     "httpx",
 ]
 
@@ -83,6 +87,10 @@ ignore = [
 
 [tool.ruff.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+# A stalled match fails its test instead of hanging the run (tests/test_pattern_deadline.py).
+timeout = 10
 
 [tool.mypy]
 python_version = "3.10"

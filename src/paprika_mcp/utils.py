@@ -7,22 +7,54 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unicodedata
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
+import regex
 from paprika_recipes.cache import DirectoryCache
 from paprika_recipes.exceptions import PaprikaError, RequestError
 from paprika_recipes.remote import Remote
 
 logger = logging.getLogger(__name__)
 
-# A pattern longer than this is refused before it is compiled. Python's `re`
-# holds the GIL for the whole of a match, so a pathological pattern run against
-# ~400 recipes stalls every thread in the process, the event loop included —
-# running tools on worker threads does not help with that. A length cap does
-# not make backtracking impossible, but it bounds how much of it a pattern can
-# describe, and no sensible ingredient search comes near it.
+T = TypeVar("T")
+
+# A pattern longer than this is refused before it is compiled. The cap does not
+# make backtracking impossible — `(a|aa)+$` is eight characters — but it bounds
+# how much of it a pattern can describe, and no sensible ingredient search comes
+# near it. What actually bounds a pattern is MATCH_SECONDS, below.
 MAX_PATTERN_LENGTH = 200
+
+# How long one tool call may spend matching a member's pattern, in total. Not
+# per match: a search runs over every field of ~400 recipes, so a per-match
+# limit would let one pattern take hours. Measured (moneypenny plans/012 § 4):
+# under `re`, `(a|aa)+$` against 45 a's was still running at five seconds, and
+# held the GIL the whole time, so every other request on the server waited.
+MATCH_SECONDS = 2.0
+
+# A plain search cannot backtrack, but `regex` still parses it character by
+# character and keeps it in its compile cache; no ingredient search is longer.
+MAX_QUERY_LENGTH = 1000
+
+# Words a member reads, part of the contract: tests assert them. None may read
+# as "nothing found" or "nothing to change" — a match that did not finish says
+# nothing either way, which is the absence rule. A plain search has its own
+# words, because "try a simpler pattern" is no advice for one: it times out
+# only when the server is slow or busy (see UserPattern on the CPU clock).
+SEARCH_TIMEOUT = (
+    "That pattern took too long to search — nothing is wrong with the recipes. "
+    "Try a simpler pattern, or search for a plain word."
+)
+PLAIN_SEARCH_TIMEOUT = (
+    "That search took too long to finish — nothing is wrong with the recipes. "
+    "Try again in a moment."
+)
+EDIT_TIMEOUT = (
+    'That pattern took too long to match in "{title}" — nothing was changed. '
+    "Try a simpler pattern, or a plain word."
+)
 
 
 class CategoriesUnavailable(Exception):
@@ -311,22 +343,107 @@ def notify_apps(remote: Remote) -> str:
     return ""
 
 
-def compile_pattern(query: str) -> re.Pattern:
-    """Compile a user's search pattern, or raise ValueError saying why not.
+class PatternTimeout(Exception):
+    """A call's matching ran past its deadline. The answer is *can't tell*."""
 
-    Raised as ValueError with the answer as its message, so an invalid pattern
-    reaches the member as "invalid pattern" — the old behaviour of returning no
-    matches read as "No recipes found matching ...", a confident no for a
-    question that was never asked.
+
+class UserPattern:
+    """A member's pattern, matched against one deadline for the whole call.
+
+    The clock starts at the first match, not at compile, so the recipe fetch
+    before it is not charged to the pattern. Each operation gets what is left;
+    once nothing is left the next one raises before it runs, rather than being
+    given a token slice — a floor of even 10 ms per operation is 40 seconds over
+    a search's ~4,000 lines.
+
+    The timeout bounds a match; releasing the GIL is what lets the rest of the
+    server run during one. Tool handlers run on worker threads that share the
+    GIL, and `re` holds it for a whole match. `regex` releases it for a `str`
+    by default — measured, a thread ticking every 10 ms managed ~36 ticks in
+    half a second beside a stalled match, and 1 with `concurrent=False` — so
+    `concurrent=True` changes nothing today and says so on the call, where a
+    later edit would have to remove it on purpose. Safe because every subject
+    is a `str`, which cannot change under the match.
+
+    `regex` measures its `timeout` in process CPU time (`clock()`), summed over
+    every thread, while the deadline here is wall time. Two slow searches at
+    once can each be cut off early. That errs toward "took too long", never
+    toward a stall, and the wall-clock deadline still bounds every call.
+    """
+
+    def __init__(self, compiled: regex.Pattern, seconds: float | None = None):
+        self._compiled = compiled
+        self._seconds = MATCH_SECONDS if seconds is None else seconds
+        self._deadline: float | None = None
+
+    def _left(self) -> float:
+        now = time.monotonic()
+        if self._deadline is None:
+            self._deadline = now + self._seconds
+        left = self._deadline - now
+        if left <= 0:
+            raise PatternTimeout
+        return left
+
+    def _run(self, operation: Callable[..., T], *args: Any) -> T:
+        try:
+            return operation(*args, timeout=self._left(), concurrent=True)
+        except TimeoutError:
+            raise PatternTimeout from None
+
+    def search(self, text: str) -> regex.Match | None:
+        return self._run(self._compiled.search, text)
+
+    def finditer(self, text: str) -> list[regex.Match]:
+        # A list, so the whole scan runs inside the one timed call: a lazy
+        # iterator would match outside `_run`, where nothing catches the timeout.
+        return self._run(lambda t, **kw: list(self._compiled.finditer(t, **kw)), text)
+
+    def sub(self, replace: str, text: str) -> str:
+        return str(self._run(lambda t, **kw: self._compiled.sub(replace, t, **kw), text))
+
+
+def compile_pattern(query: str, ignore_case: bool = True) -> UserPattern:
+    """Compile a member's pattern, or raise ValueError saying why not.
+
+    The one way a member's text becomes a pattern, for search_recipes and
+    update_recipe alike. Raised as ValueError with the answer as its message,
+    so an invalid pattern reaches the member as "invalid pattern" — the old
+    behaviour of returning no matches read as "No recipes found matching ...",
+    a confident no for a question that was never asked. Search ignores case;
+    an edit does not, because it replaces what it finds.
+
+    A pattern must also be one `re` accepts. `regex` adds group calls —
+    `(?R)`, `(?1)`, `(?&name)` — and a call that recurses without consuming
+    text grows memory rather than time: measured, `(?:x|(?R))+$` reached 289 MB
+    in 0.4 s and `((?:a|(?1))*)+$` 420 MB in 0.6 s, both well inside the
+    deadline, which bounds time and nothing else. Ordinary backtracking stayed
+    near 30 MB. `re` refuses all three forms, so it is the syntax gate; it never
+    matches anything here. Fuzzy matching (`{e<=1}`) gets past it — `re` reads
+    the braces as literal text — and was measured bounded (31 MB).
     """
     if len(query) > MAX_PATTERN_LENGTH:
         raise ValueError(
             f"Error: Regex pattern is {len(query)} characters; the limit is {MAX_PATTERN_LENGTH}."
         )
     try:
-        return re.compile(query, re.IGNORECASE)
+        compiled = regex.compile(query, regex.IGNORECASE if ignore_case else 0)
+    except regex.error as e:
+        raise ValueError(f"Error: Invalid regex pattern '{query}': {e}") from None
+    try:
+        re.compile(query)
     except re.error as e:
         raise ValueError(f"Error: Invalid regex pattern '{query}': {e}") from None
+    return UserPattern(compiled)
+
+
+def literal_pattern(text: str) -> UserPattern:
+    """A plain search as a pattern, so plain and regex searches share one path.
+
+    Folded before it is escaped, so "gruyere" and "gruyère" both find
+    "Gruyère" on the folded line. Not capped: plain text cannot backtrack.
+    """
+    return UserPattern(regex.compile(regex.escape(fold(text)), regex.IGNORECASE))
 
 
 def fold(text: str) -> str:
@@ -352,20 +469,18 @@ def normalize_string(text: str) -> str:
     return fold(text)
 
 
-def search_in_text(
-    text: str, query: str | re.Pattern, context_lines: int = 2, regex: bool = False
-) -> list[dict[str, Any]]:
-    """Search for query in text and return matches with context.
+def search_in_text(text: str, pattern: UserPattern, context_lines: int = 2) -> list[dict[str, Any]]:
+    """Search for a pattern in text and return matches with context.
 
     Args:
         text: Text to search in
-        query: Search query (plain text, or a pattern from compile_pattern)
+        pattern: From compile_pattern or literal_pattern. The caller compiles
+            it once, so an invalid one is refused before the search rather than
+            swallowed here as "no matches".
         context_lines: Number of lines of context around matches
-        regex: If True, query is a compiled pattern. The caller compiles it
-            once, through compile_pattern, so an invalid one is refused before
-            the search rather than swallowed here as "no matches".
 
-    Returns list of dicts with 'line', 'match', and 'context' keys.
+    Returns list of dicts with 'line', 'match', and 'context' keys. Raises
+    PatternTimeout when the call's deadline passes.
     """
     if not text:
         return []
@@ -373,31 +488,13 @@ def search_in_text(
     matches = []
     lines = text.split("\n")
 
-    if regex:
-        pattern = query if isinstance(query, re.Pattern) else compile_pattern(query)
-        for i, line in enumerate(lines):
-            # Tried on the folded line as well, so 'gruyere|emmental' finds
-            # "Gruyère" without the pattern having to spell the accent.
-            if pattern.search(line) or pattern.search(fold(line)):
-                # Get context lines before and after
-                start = max(0, i - context_lines)
-                end = min(len(lines), i + context_lines + 1)
-                context = "\n".join(lines[start:end])
-
-                matches.append(
-                    {"line": i + 1, "match": line.strip(), "context": context}
-                )
-    else:
-        query_folded = fold(query)
-        for i, line in enumerate(lines):
-            if query_folded in fold(line):
-                # Get context lines before and after
-                start = max(0, i - context_lines)
-                end = min(len(lines), i + context_lines + 1)
-                context = "\n".join(lines[start:end])
-
-                matches.append(
-                    {"line": i + 1, "match": line.strip(), "context": context}
-                )
+    for i, line in enumerate(lines):
+        # Tried on the folded line as well, so 'gruyere|emmental' finds
+        # "Gruyère" without the pattern having to spell the accent.
+        if pattern.search(line) or pattern.search(fold(line)):
+            start = max(0, i - context_lines)
+            end = min(len(lines), i + context_lines + 1)
+            context = "\n".join(lines[start:end])
+            matches.append({"line": i + 1, "match": line.strip(), "context": context})
 
     return matches
