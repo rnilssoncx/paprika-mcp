@@ -20,6 +20,8 @@ class RecipeRemote:
         self.categories = list(categories)
         self.category_error = None
         self.category_gets = 0
+        # The meal planner, for the export (meal_plan's tests script their own).
+        self.meals = []
         self.uploaded, self.notified, self.notify_error = [], 0, None
 
     @property
@@ -30,6 +32,8 @@ class RecipeRemote:
             yield RemoteRecipe(**r.as_dict())
 
     def _request(self, method, path, **kwargs):
+        if (method, path) == ("get", "/api/v2/sync/meals/"):
+            return Response({"result": list(self.meals)})
         assert (method, path) == ("get", "/api/v2/sync/categories/"), (method, path)
         self.category_gets += 1
         if self.category_error:

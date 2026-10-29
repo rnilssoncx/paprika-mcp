@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, TypeVar
 
 import regex
@@ -467,6 +467,36 @@ def normalize_string(text: str) -> str:
     ambiguous by read_recipe, so ignoring accents cannot pick one silently.
     """
     return fold(text)
+
+
+class AmbiguousTitle(Exception):
+    """More than one live recipe answers to a title; `matches` holds them all."""
+
+    def __init__(self, matches: list[Any]):
+        super().__init__(f"{len(matches)} recipes share a title")
+        self.matches = matches
+
+
+def find_by_title(recipes: Iterable[Any], title: str) -> Any | None:
+    """The one live recipe with this title, or None; AmbiguousTitle for two.
+
+    The title lookup for every tool that takes one — read_recipe and
+    restore_recipe call this, not copies of it (moneypenny plans/012 § 1c). A
+    second copy is how one tool comes to skip the trash and the other not.
+
+    Recipes in the trash are skipped. A trashed copy used to win if it came
+    first, so the member read — and, with the uid this returns, then edited or
+    restored — the recipe in the trash rather than the live one. Two live
+    recipes whose titles fold to the same string (case and accents ignored, see
+    fold) are refused rather than picked between: whichever came first would be
+    a guess the member never sees. Each tool words the refusal itself, since
+    what to do next differs.
+    """
+    wanted = normalize_string(title)
+    matches = [r for r in recipes if not r.in_trash and normalize_string(r.name or "") == wanted]
+    if len(matches) > 1:
+        raise AmbiguousTitle(matches)
+    return matches[0] if matches else None
 
 
 def search_in_text(text: str, pattern: UserPattern, context_lines: int = 2) -> list[dict[str, Any]]:

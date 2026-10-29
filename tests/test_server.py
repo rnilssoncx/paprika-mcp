@@ -18,6 +18,7 @@ from paprika_mcp.tools import (
     list_categories,
     meal_plan,
     read_recipe,
+    restore_recipe,
     search_recipes,
     update_recipe,
 )
@@ -31,6 +32,7 @@ CALLS = {
     "search_recipes": {"query": ""},
     "read_recipe": {"id": "A1-0A"},
     "update_recipe": {"id": "A1-0A", "field": "notes", "find": "a", "replace": "b"},
+    "restore_recipe": {"recipe": "A1-0A", "date": "2026-10-20"},
     "list_categories": {},
     "format_fraction": {"fraction": "1/4"},
     "list_meals": {},
@@ -53,7 +55,7 @@ def offline(monkeypatch):
     def refuse():
         raise RuntimeError(OFFLINE)
 
-    for module in (search_recipes, read_recipe, update_recipe, list_categories, meal_plan):
+    for module in (search_recipes, read_recipe, update_recipe, restore_recipe, list_categories, meal_plan):
         monkeypatch.setattr(module, "get_remote", refuse)
 
 

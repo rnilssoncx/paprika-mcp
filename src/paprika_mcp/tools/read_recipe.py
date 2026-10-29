@@ -5,10 +5,11 @@ from typing import Any
 from mcp.types import TextContent
 
 from ..utils import (
+    AmbiguousTitle,
     CategoriesUnavailable,
+    find_by_title,
     get_categories,
     get_remote,
-    normalize_string,
     translate_category_uids,
 )
 
@@ -43,34 +44,25 @@ def read_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
                 )
             ]
     else:
-        # Search by title, among recipes not in the trash. A trashed copy used
-        # to win if it came first, so the member read — and, with the uid this
-        # returns, then edited — the recipe in the trash rather than the live
-        # one. Two live recipes with one title are refused rather than picked
-        # between: whichever came first would be a guess the member never sees.
-        normalized_search = normalize_string(recipe_title)
-        matches = [
-            r
-            for r in remote.recipes
-            if not r.in_trash and normalize_string(r.name) == normalized_search
-        ]
-
-        if not matches:
+        # By title, through the one lookup restore_recipe also uses: trash
+        # skipped, two live matches refused (utils.find_by_title says why).
+        try:
+            recipe = find_by_title(remote.recipes, recipe_title)
+        except AmbiguousTitle as e:
+            ids = ", ".join(r.uid for r in e.matches)
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Error: {len(e.matches)} recipes are titled '{recipe_title}': {ids}. Read one by id.",
+                )
+            ]
+        if recipe is None:
             return [
                 TextContent(
                     type="text",
                     text=f"Error: No recipe found with title '{recipe_title}'",
                 )
             ]
-        if len(matches) > 1:
-            ids = ", ".join(r.uid for r in matches)
-            return [
-                TextContent(
-                    type="text",
-                    text=f"Error: {len(matches)} recipes are titled '{recipe_title}': {ids}. Read one by id.",
-                )
-            ]
-        recipe = matches[0]
 
     # Define all available fields and their formatters
     # Translate category UUIDs to names — fetched only when the answer shows

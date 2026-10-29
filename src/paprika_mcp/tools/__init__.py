@@ -18,6 +18,8 @@ from .meal_plan import (
 )
 from .read_recipe import TOOL_DEFINITION as READ_RECIPE_DEF
 from .read_recipe import read_recipe_tool
+from .restore_recipe import TOOL_DEFINITION as RESTORE_RECIPE_DEF
+from .restore_recipe import restore_recipe_tool
 from .search_recipes import TOOL_DEFINITION as SEARCH_RECIPES_DEF
 from .search_recipes import search_recipes_tool
 from .update_recipe import TOOL_DEFINITION as UPDATE_RECIPE_DEF
@@ -36,6 +38,10 @@ TOOLS = {
     "update_recipe": {
         "definition": UPDATE_RECIPE_DEF,
         "handler": update_recipe_tool,
+    },
+    "restore_recipe": {
+        "definition": RESTORE_RECIPE_DEF,
+        "handler": restore_recipe_tool,
     },
     "list_categories": {
         "definition": LIST_CATEGORIES_DEF,
@@ -57,6 +63,7 @@ __all__ = [
     "search_recipes_tool",
     "read_recipe_tool",
     "update_recipe_tool",
+    "restore_recipe_tool",
     "list_categories_tool",
     "format_fraction_tool",
 ]
