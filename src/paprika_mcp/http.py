@@ -1,24 +1,24 @@
-"""Serve the MCP tools over Streamable HTTP, behind the household's sign-in (035).
+"""Serve the MCP tools over Streamable HTTP, behind the household's sign-in (037).
 
 For clients that cannot launch a local process, such as cloud-hosted MCP
 connectors. There is one Paprika account and any household member may use it, so
-the gate is not a shared secret: Caddy forwards only requests Cloudflare Access
-signed, `control.identity.IdentityGate` verifies the assertion and asks Q Branch
-who it is, and `members_only` refuses every tool call from anyone who is not a
-listed member. The old static bearer token is gone and is read nowhere.
+the gate is not a shared secret. Caddy asks Q Branch's `/verify` about the Cloudflare
+Access assertion, deletes it, and forwards the request with headers naming the caller;
+`control.identity.HubGate` reads them, and `members_only` refuses every tool call and
+`prompts/get` from anyone who is not a member. This server verifies nothing and asks
+Q Branch nothing. **It is safe only because nothing but Caddy can open a connection to
+its port** (037 § Each server listens only for Caddy), which is the compose entry's
+property and not this module's.
 
-    ACCESS_TEAM=... MCP_AUD=... MCP_HOST=... MCP_PATH=/paprika \\
-    CONTROL_SPOKE=... CONTROL_URL=... paprika-mcp http
+    MCP_HOST=... MCP_PATH=/paprika paprika-mcp http
 """
 
 import contextlib
 import copy
 import os
-from collections.abc import Callable
-from typing import Any
 
 import uvicorn
-from control.identity import IdentityGate, Settings, StartRefused, members_only
+from control.identity import HubGate, Settings, StartRefused, members_only
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -27,13 +27,8 @@ from starlette.routing import Route
 from .server import app as mcp_server
 
 
-def build(
-    settings: Settings,
-    *,
-    clock: Callable[[], float] | None = None,
-    transport: Any = None,
-) -> IdentityGate:
-    """The ASGI app: one route at `settings.path`, behind `IdentityGate`.
+def build(settings: Settings) -> HubGate:
+    """The ASGI app: one route at `settings.path`, behind `HubGate`.
 
     **The route is a bare path, never `/mcp`** (035 § Paths, not prefixes stripped).
     `redirect_slashes = False` so `/paprika/` is a 404 rather than a redirect to a URL
@@ -72,13 +67,10 @@ def build(
         lifespan=lifespan,
     )
     inner.router.redirect_slashes = False
-    kwargs: dict[str, Any] = {"transport": transport}
-    if clock is not None:
-        kwargs["clock"] = clock
     # No member list: there is one Paprika account and any member Q Branch names may use it,
-    # so `Directory` takes the id Q Branch names (`members=None`) and a list here could only
-    # drift from Q Branch's own. `MCP_HOST` and `MCP_PATH` are refused by `Settings`.
-    return settings.build(inner, None, **kwargs)
+    # so `members=None` takes the id Caddy names and a list here could only drift from the
+    # household manifest. `MCP_HOST` and `MCP_PATH` are refused by `Settings`.
+    return settings.build(inner, None)
 
 
 def run():

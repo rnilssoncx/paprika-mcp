@@ -35,7 +35,7 @@ dependencies = [
     # A member's pattern is matched with `regex`, not `re`, for its per-call
     # timeout and for releasing the GIL while it matches (utils.UserPattern).
     "regex>=2024.4.16",
-    # The identity library: IdentityGate, Directory, members_only (035). By path, as
+    # The identity library: HubGate, members_only (037). By path, as
     # Quartermaster does; see [tool.uv.sources]. It needs Python 3.12.
     "qbranch",
 ]
