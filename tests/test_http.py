@@ -16,7 +16,7 @@ import httpx
 import jwt
 import pytest
 from control import words
-from control.identity import Settings, StartRefused
+from control.identity import Settings
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 from mcp.types import TextContent
@@ -38,7 +38,6 @@ ENV = {
     "MCP_PATH": "/paprika",
     "CONTROL_SPOKE": "172.31.34.0/24",
     "CONTROL_URL": "http://172.31.34.2:3033",
-    "MEMBERS": "alice,bob",
 }
 # A local address that is not on the spoke: the gate refuses `testserver` as "on the spoke".
 CADDY_SIDE = "http://10.0.0.5"
@@ -76,10 +75,9 @@ def assertion(sub="sub-alice", aud=AUD):
     return jwt.encode(claims, KEY, algorithm="RS256", headers={"kid": KID})
 
 
-def production_app(plane, env=None, members=None):
+def production_app(plane, env=None):
     settings = Settings.from_environ({**ENV, **(env or {})})
-    return http.build(settings, members or http.members_from(ENV), clock=lambda: NOW,
-                      transport=plane)
+    return http.build(settings, clock=lambda: NOW, transport=plane)
 
 
 def client_for(plane, **kw):
@@ -148,9 +146,6 @@ REFUSALS = [
     ("unknown", {"kind": "unknown"}, False, words.unknown_sign_in),
     ("unlisted", {"kind": "unlisted"}, False, words.unlisted_sign_in),
     ("down", None, True, words.cant_tell),
-    # Q Branch names a member this server's MEMBERS does not list: can't tell, not served.
-    ("not-in-members", {"kind": "member", "member": "carol", "role": "member"}, False,
-     words.cant_tell),
 ]
 
 
@@ -175,6 +170,39 @@ def test_every_tool_refuses_each_unservable_caller_with_its_words(monkeypatch, a
             assert response.status_code == 200
             assert text_of(response) == (True, expected)
     assert spy.calls == []
+
+
+@pytest.mark.parametrize(("answer", "down", "expected"), [r[1:] for r in REFUSALS],
+                         ids=[r[0] for r in REFUSALS])
+def test_every_prompt_is_refused_in_the_same_words_for_a_caller_who_is_not_a_member(
+    monkeypatch, answer, down, expected,
+):
+    """`members_only` guards `prompts/get` as well as `tools/call` (security M1: the prompt
+    handler reads a file from the container's home). The names are read off the server.
+    The refusal is a JSON-RPC error whose message is the words. Listing stays open.
+    **Verified by reverting `members_only`'s installation in `paprika_mcp/http.py` `build()`.**"""
+    plane = Plane()
+    if answer:
+        plane.answer = answer
+    from paprika_mcp.prompts import PROMPTS
+    spied = []
+
+    async def handler(arguments):
+        spied.append(arguments)
+        return "served"
+
+    for name, prompt in PROMPTS.items():
+        monkeypatch.setitem(PROMPTS, name, {**prompt, "handler": handler})
+    with client_for(plane) as client:
+        listed = post(client, {"jsonrpc": "2.0", "id": 1, "method": "prompts/list", "params": {}})
+        names = [p["name"] for p in body_of(listed)["result"]["prompts"]]
+        assert set(names) == set(PROMPTS) and names
+        plane.down = down
+        for name in names:
+            response = post(client, {"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+                                     "params": {"name": name}}, token=assertion(sub=f"sub-{name}"))
+            assert body_of(response)["error"]["message"] == expected, name
+    assert spied == []
 
 
 def test_a_member_reaches_every_tool(monkeypatch):
@@ -268,18 +296,13 @@ def test_the_shared_server_is_left_unwrapped(monkeypatch):
     assert server.app.request_handlers[types.CallToolRequest] is before
 
 
-def test_the_endpoint_needs_both_a_path_and_a_host():
-    with pytest.raises(StartRefused, match="MCP_PATH and MCP_HOST"):
-        production_app(Plane(), env={"MCP_HOST": ""})
-    with pytest.raises(StartRefused, match="MCP_PATH and MCP_HOST"):
-        production_app(Plane(), env={"MCP_PATH": ""})
-
-
 @pytest.mark.parametrize(("drop", "text"), [
     ("ACCESS_TEAM", words.identity_missing),
     ("MCP_AUD", words.identity_missing),
     ("CONTROL_URL", "refused: CONTROL_URL is required"),
-    ("MEMBERS", "refused: MEMBERS is required (a comma list of member ids)"),
+    # The library's words for the endpoint: this server holds no refusal of its own.
+    ("MCP_HOST", words.mcp_host_missing),
+    ("MCP_PATH", words.mcp_path_missing),
 ])
 def test_the_server_will_not_start_without_its_settings(monkeypatch, drop, text):
     for name, value in ENV.items():
@@ -296,13 +319,10 @@ def test_the_server_starts_and_binds_to_localhost_by_default(monkeypatch):
     for name, value in ENV.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("PAPRIKA_MCP_HOST", raising=False)
-    monkeypatch.setattr(http.uvicorn, "run", lambda app, host, port: seen.update(host=host))
+    monkeypatch.setattr(http.uvicorn, "run", lambda app, host, port, access_log: seen.update(host=host, log=access_log))
     http.run()
-    assert seen["host"] == "127.0.0.1"
-
-
-def test_members_are_a_trimmed_comma_list():
-    assert http.members_from({"MEMBERS": " alice , bob,,"}) == {"alice", "bob"}
+    # Caddy writes the access line already (security M4): the server's own is off.
+    assert seen == {"host": "127.0.0.1", "log": False}
 
 
 def test_base64_is_not_how_the_assertion_is_read():
