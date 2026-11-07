@@ -18,7 +18,7 @@ name = "paprika-mcp"
 version = "0.1.0"
 description = "MCP server for Paprika recipe manager"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "Brian Tkatch" }
 ]
@@ -35,6 +35,9 @@ dependencies = [
     # A member's pattern is matched with `regex`, not `re`, for its per-call
     # timeout and for releasing the GIL while it matches (utils.UserPattern).
     "regex>=2024.4.16",
+    # The identity library: IdentityGate, Directory, members_only (035). By path, as
+    # Quartermaster does; see [tool.uv.sources]. It needs Python 3.12.
+    "qbranch",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +51,9 @@ dev = [
     "pytest-timeout>=2.3",
     "httpx",
 ]
+
+[tool.uv.sources]
+qbranch = { path = "../qbranch", editable = true }
 
 [project.scripts]
 paprika-mcp = "paprika_mcp.__main__:main"
