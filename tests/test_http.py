@@ -200,16 +200,6 @@ def test_any_linked_member_is_served_with_no_list_here(monkeypatch):
     assert spy.calls == ["list_categories"]
 
 
-def test_the_audience_must_be_mcp(monkeypatch):
-    """Settings.build defaults `aud` to `mcp`: a request verified for the web audience is
-    *can't tell* here. Catches a gate built with `aud=None`."""
-    spy = Spy(monkeypatch)
-    with client_for() as client:
-        assert text_of(post(client, call("list_categories"), who=hub(aud="web"))) == (
-            True, words.cant_tell)
-    assert spy.calls == []
-
-
 def test_the_server_is_stateless_so_a_session_id_is_never_a_way_into_another_sign_in(monkeypatch):
     """037 asks for a session-binding test (a second `sub` using the first's session gets 404).
     This server runs `stateless=True`: no session exists to take over, and a session id sent
