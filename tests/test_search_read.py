@@ -173,6 +173,24 @@ def test_a_failed_category_fetch_is_not_no_categories(monkeypatch):
     assert call("list_categories", lc, remote, monkeypatch) == "Error: Could not fetch categories from Paprika (ConnectionError: timed out)."
 
 
+def test_list_categories_shows_the_id_beside_each_shared_name_in_the_flat_list_only(monkeypatch):
+    # Catches an id on every line, or on none, or in the tree.
+    ethnic = category("C-ETH", "Ethnic")
+    # "Thaï" folds to "thai" (catches a .lower() comparison); Pad is nested and unique (catches an id on every nested line).
+    remote = RecipeRemote([], [ethnic, category("C-THT", "Thai"), category("C-THU", "Thaï", parent="C-ETH"),
+                               category("C-PAD", "Pad", parent="C-ETH"), SOUPS])
+    text = call("list_categories", lc, remote, monkeypatch)
+    tree, flat = text.split("## Flat List (for reference):")
+    assert "id C-" not in tree
+    assert flat.splitlines()[1:] == [
+        "- Ethnic",
+        "- Pad (Parent: Ethnic)",
+        "- Soups",
+        "- Thai (id C-THT)",
+        "- Thaï (Parent: Ethnic, id C-THU)",
+    ]
+
+
 # ---- the recipe cache, shared by concurrent tool calls ----
 
 

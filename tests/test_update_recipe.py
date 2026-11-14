@@ -173,7 +173,7 @@ def test_categories_are_replaced_by_name_and_uploaded_as_ids(monkeypatch):
 def test_a_category_added_in_the_app_is_usable_on_the_next_call(monkeypatch):
     remote = RecipeRemote([roast()], [DINNER])
     first = update(remote, monkeypatch, field="categories", find="Dinner", replace="Soups")
-    assert first == "Error: Category 'Soups' not found in Paprika — cannot convert back to UUID. No changes were saved."
+    assert first == 'Error: No category is named "Soups". Use list_categories to see them, or create_category to add it. No changes were saved.'
     remote.categories.append(SOUPS)  # a member adds it in the app; the server keeps running
     update(remote, monkeypatch, field="categories", find="Dinner", replace="Soups")
     assert [u["categories"] for u in remote.uploaded] == [["C-SOU"]]
@@ -185,3 +185,94 @@ def test_a_failed_category_fetch_saves_nothing(monkeypatch):
     text = update(remote, monkeypatch, field="categories", find="Dinner", replace="Soups")
     assert text == "Error: Could not fetch categories from Paprika (ConnectionError: timed out). No changes were saved."
     assert remote.uploaded == []
+
+
+# ---- shared category names: lines are paired with uids by count, not by name ----
+
+ETHNIC = category("C-ETH", "Ethnic")
+THAI_TOP = category("C-THT", "Thai")
+THAI_UNDER = category("C-THU", "Thai", parent="C-ETH")
+SHARED = [DINNER, SOUPS, ETHNIC, THAI_TOP, THAI_UNDER]
+
+
+@pytest.mark.parametrize("held", ["C-THT", "C-THU"])
+@pytest.mark.parametrize("listed", [[THAI_TOP, THAI_UNDER], [THAI_UNDER, THAI_TOP]])
+def test_an_unrelated_category_edit_keeps_the_thai_the_recipe_was_in(monkeypatch, held, listed):
+    # Catches today's last-wins dict, and a first-wins setdefault: each fails
+    # for one of the four combinations.
+    remote = RecipeRemote([roast(categories=[held, "C-DIN"])], [DINNER, SOUPS, ETHNIC, *listed])
+    update(remote, monkeypatch, field="categories", find="Dinner", replace="Soups")
+    assert [u["categories"] for u in remote.uploaded] == [[held, "C-SOU"]]
+
+
+def test_a_recipe_in_both_thais_keeps_both_in_order(monkeypatch):
+    # Catches a dict keyed by name collapsing the two lines into one uid.
+    for held in (["C-THT", "C-THU", "C-DIN"], ["C-THU", "C-THT", "C-DIN"]):
+        remote = RecipeRemote([roast(categories=held)], SHARED)
+        update(remote, monkeypatch, field="categories", find="Dinner", replace="Soups")
+        assert [u["categories"] for u in remote.uploaded] == [[*held[:2], "C-SOU"]]
+
+
+def test_adding_a_shared_name_to_a_recipe_already_in_one_of_them_is_refused(monkeypatch):
+    # Catches pairing every Thai line with the held uid, which would silently duplicate it.
+    remote = RecipeRemote([roast(categories=["C-THT", "C-DIN"])], SHARED)
+    text = update(remote, monkeypatch, field="categories", find="Dinner", replace="Thai")
+    assert text == (
+        'Error: "Thai" names 2 categories: "Thai" (id C-THT, top level), "Thai" (id C-THU, under "Ethnic"). '
+        "Name one by its id. No changes were saved."
+    )
+    assert remote.uploaded == []
+
+
+def test_a_dangling_category_uid_survives_an_unrelated_edit(monkeypatch):
+    # Catches today's refusal of the `Unknown-...` line.
+    remote = RecipeRemote([roast(categories=["GONE-1234-5678", "C-DIN"])], [DINNER, SOUPS])
+    update(remote, monkeypatch, field="categories", find="Dinner", replace="Soups")
+    assert [u["categories"] for u in remote.uploaded] == [["GONE-1234-5678", "C-SOU"]]
+
+
+def test_a_category_added_by_its_id_is_accepted(monkeypatch):
+    remote = RecipeRemote([roast(categories=["C-DIN"])], SHARED)
+    update(remote, monkeypatch, field="categories", find="Dinner", replace="C-THU")
+    assert [u["categories"] for u in remote.uploaded] == [["C-THU"]]
+
+
+def test_removing_one_of_two_same_named_lines_is_refused(monkeypatch):
+    # Catches count pairing keeping the first held Thai when the member removed the first line.
+    remote = RecipeRemote([roast(categories=["C-THT", "C-THU", "C-DIN"])], SHARED)
+    text = update(remote, monkeypatch, field="categories", find=r"\AThai\n", replace="", regex=True)
+    assert text == (
+        'Error: Recipe "Roast" is in 2 categories shown as "Thai", so removing one of them by name '
+        "cannot say which. No changes were saved. Remove them all, then add back the one to keep by its id "
+        "(list_categories shows it)."
+    )
+    assert remote.uploaded == []
+
+
+def test_removing_both_same_named_lines_is_allowed(monkeypatch):
+    remote = RecipeRemote([roast(categories=["C-THT", "C-THU", "C-DIN"])], SHARED)
+    update(remote, monkeypatch, field="categories", find="Thai\nThai\n", replace="")
+    assert [u["categories"] for u in remote.uploaded] == [["C-DIN"]]
+
+
+def test_an_addition_resolving_to_a_held_uid_is_not_duplicated(monkeypatch):
+    # Catches an id appended twice: "C-DIN" by id beside the held Dinner line.
+    remote = RecipeRemote([roast(categories=["C-DIN"])], SHARED)
+    text = update(remote, monkeypatch, field="categories", find="Dinner", replace="Dinner\nC-DIN")
+    assert [u["categories"] for u in remote.uploaded] == [["C-DIN"]]
+    assert text == "Successfully updated categories in recipe 'Roast' (ID: A1-0A)\n\nOld categories:\nDinner\n\nNew categories:\nDinner"
+
+
+def test_two_copies_of_one_category_can_lose_one(monkeypatch):
+    # Catches refusing as ambiguous when both lines are the same uid.
+    remote = RecipeRemote([roast(categories=["C-DIN", "C-DIN", "C-SOU"])], SHARED)
+    update(remote, monkeypatch, field="categories", find=r"\ADinner\n", replace="", regex=True)
+    assert [u["categories"] for u in remote.uploaded] == [["C-DIN", "C-SOU"]]
+
+
+@pytest.mark.parametrize("listed", [[THAI_TOP, THAI_UNDER], [THAI_UNDER, THAI_TOP]])
+def test_a_line_added_before_a_held_shared_name_keeps_it(monkeypatch, listed):
+    # Catches pairing by position: Thai moves to index 1, where Dinner was.
+    remote = RecipeRemote([roast(categories=["C-THU", "C-DIN"])], [DINNER, SOUPS, ETHNIC, *listed])
+    update(remote, monkeypatch, field="categories", find="Thai", replace="Soups\nThai")
+    assert [u["categories"] for u in remote.uploaded] == [["C-SOU", "C-THU", "C-DIN"]]

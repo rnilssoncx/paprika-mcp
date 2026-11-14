@@ -15,6 +15,8 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from paprika_mcp.server import app
 from paprika_mcp.tools import (
     TOOLS,
+    categories,
+    create_recipe,
     list_categories,
     meal_plan,
     read_recipe,
@@ -33,6 +35,11 @@ CALLS = {
     "read_recipe": {"id": "A1-0A"},
     "update_recipe": {"id": "A1-0A", "field": "notes", "find": "a", "replace": "b"},
     "restore_recipe": {"recipe": "A1-0A", "date": "2026-10-20"},
+    "create_recipe": {"name": "Chili"},
+    "create_category": {"name": "Soups"},
+    "rename_category": {"category": "Soups", "new_name": "Broths"},
+    "move_category": {"category": "Soups", "parent": ""},
+    "delete_category": {"category": "Soups"},
     "list_categories": {},
     "format_fraction": {"fraction": "1/4"},
     "list_meals": {},
@@ -55,7 +62,7 @@ def offline(monkeypatch):
     def refuse():
         raise RuntimeError(OFFLINE)
 
-    for module in (search_recipes, read_recipe, update_recipe, restore_recipe, list_categories, meal_plan):
+    for module in (search_recipes, read_recipe, update_recipe, restore_recipe, list_categories, meal_plan, create_recipe, categories):
         monkeypatch.setattr(module, "get_remote", refuse)
 
 
@@ -108,3 +115,34 @@ async def test_a_slow_tool_call_does_not_stall_other_requests(monkeypatch):
             release.set()
     assert "slow" in {t.name for t in tools.tools}
     assert still_running, "list_tools was answered only after the slow call finished"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "name, arguments",
+    [
+        ("create_recipe", {"name": "Roast", "notes": ["x"]}),
+        ("create_recipe", {"name": "Roast", "rating": True}),
+        ("create_recipe", {"name": "Roast", "keep_both": "false"}),
+        ("rename_category", {"category": "Soups", "new_name": 5}),
+    ],
+)
+async def test_a_wrongly_typed_argument_is_refused_by_the_schema_before_the_handler(offline, name, arguments):
+    # The handlers carry no "not text" refusal because this check exists (051):
+    # a schema that lost a field's type would let a list reach the upload.
+    async with create_connected_server_and_client_session(app) as client:
+        result = await client.call_tool(name, arguments)
+        assert result.isError and result.content[0].text.startswith("Input validation error"), result.content[0].text
+
+
+@pytest.mark.anyio
+async def test_the_new_tools_carry_their_annotations_on_the_wire():
+    # server.py builds each Tool from its definition; one that dropped
+    # `annotations` would pass a test that reads TOOLS.
+    async with create_connected_server_and_client_session(app) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    destructive = {name: tools[name].annotations.destructiveHint for name in
+                   ("create_recipe", "create_category", "rename_category", "move_category", "delete_category")}
+    assert destructive == {"create_recipe": False, "create_category": False,
+                           "rename_category": True, "move_category": True, "delete_category": True}
+    assert all(tools[name].annotations.readOnlyHint is False for name in destructive)

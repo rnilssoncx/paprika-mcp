@@ -234,7 +234,7 @@ def test_only_the_mcp_host_is_accepted():
     """Catches `security_settings` left off, or allowing the old hostname alongside the new."""
     with client_for() as client:
         assert post(client, LIST_TOOLS, host=HOST).status_code == 200
-        assert post(client, LIST_TOOLS, host="paprika-mcp.nilssonstudios.com").status_code == 421
+        assert post(client, LIST_TOOLS, host="paprika-mcp.example.com").status_code == 421
         assert post(client, LIST_TOOLS, host="10.0.0.5").status_code == 421
 
 

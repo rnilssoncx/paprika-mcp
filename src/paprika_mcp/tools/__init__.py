@@ -1,5 +1,17 @@
 """Tools module - exports all MCP tool implementations."""
 
+from .categories import (
+    CREATE_CATEGORY_DEF,
+    DELETE_CATEGORY_DEF,
+    MOVE_CATEGORY_DEF,
+    RENAME_CATEGORY_DEF,
+    create_category_tool,
+    delete_category_tool,
+    move_category_tool,
+    rename_category_tool,
+)
+from .create_recipe import TOOL_DEFINITION as CREATE_RECIPE_DEF
+from .create_recipe import create_recipe_tool
 from .format_fraction import TOOL_DEFINITION as FORMAT_FRACTION_DEF
 from .format_fraction import format_fraction_tool
 from .list_categories import TOOL_DEFINITION as LIST_CATEGORIES_DEF
@@ -39,6 +51,14 @@ TOOLS = {
         "definition": UPDATE_RECIPE_DEF,
         "handler": update_recipe_tool,
     },
+    "create_recipe": {
+        "definition": CREATE_RECIPE_DEF,
+        "handler": create_recipe_tool,
+    },
+    "create_category": {"definition": CREATE_CATEGORY_DEF, "handler": create_category_tool},
+    "rename_category": {"definition": RENAME_CATEGORY_DEF, "handler": rename_category_tool},
+    "move_category": {"definition": MOVE_CATEGORY_DEF, "handler": move_category_tool},
+    "delete_category": {"definition": DELETE_CATEGORY_DEF, "handler": delete_category_tool},
     "restore_recipe": {
         "definition": RESTORE_RECIPE_DEF,
         "handler": restore_recipe_tool,
@@ -64,6 +84,11 @@ __all__ = [
     "read_recipe_tool",
     "update_recipe_tool",
     "restore_recipe_tool",
+    "create_recipe_tool",
+    "create_category_tool",
+    "rename_category_tool",
+    "move_category_tool",
+    "delete_category_tool",
     "list_categories_tool",
     "format_fraction_tool",
 ]

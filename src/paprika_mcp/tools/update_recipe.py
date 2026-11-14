@@ -9,12 +9,14 @@ from mcp.types import TextContent
 from ..utils import (
     EDIT_TIMEOUT,
     CategoriesUnavailable,
+    CategoryRefused,
     PatternTimeout,
     UserPattern,
     compile_pattern,
     get_categories,
     get_remote,
     notify_apps,
+    resolve_category,
 )
 
 # The text fields find/replace works on. Checked in the handler, not only in the
@@ -61,6 +63,13 @@ FIELD_LIMIT = 64_000
 TOO_LONG = (
     "Error: That edit would make field '{field}' of recipe '{name}' {length} characters long; "
     "an edit may write at most {limit}. No changes were saved."
+)
+
+
+AMBIGUOUS_REMOVAL = (
+    'Error: Recipe "{name}" is in {k} categories shown as "{text}", so removing one of them by name '
+    "cannot say which. No changes were saved. Remove them all, then add back the one to keep by its id "
+    "(list_categories shows it)."
 )
 
 
@@ -144,13 +153,11 @@ def update_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
         except CategoriesUnavailable as e:
             return _text(f"Error: {e}. No changes were saved.")
         uid_to_name = categories_info["uid_to_name"]
-        name_to_uid = categories_info["name_to_uid"]
 
         # Convert UUID list to newline-separated names for find/replace
         current_uids = recipe.categories if isinstance(recipe.categories, list) else []
-        current_names = "\n".join(
-            uid_to_name.get(uid, f"Unknown-{uid[:8]}") for uid in current_uids
-        )
+        lines = [uid_to_name.get(uid, f"Unknown-{uid[:8]}") for uid in current_uids]
+        current_names = "\n".join(lines)
 
         try:
             if matches_empty(current_names, find, pattern):
@@ -170,20 +177,57 @@ def update_recipe_tool(args: dict[str, Any]) -> list[TextContent]:
         if new_names == current_names.strip():
             return _text(f"No changes made - pattern '{find}' not found in categories of recipe '{recipe.name}'")
 
-        # Convert names back to UUIDs
+        # Convert lines back to UUIDs — by count, not by name. A name is not
+        # a key: the account has three shared names (a *Thai* at the top level
+        # and another under *Ethnic*), and a name->uid dict keeps one of two, so
+        # a recipe in the second *Thai* came back in the first after any edit of
+        # its categories. So each line the recipe already had takes the uid it
+        # came from: for the lines with a given text, in order, the first k take
+        # the recipe's k held uids for that text, in their original order. A
+        # dangling uid (an `Unknown-xxxxxxxx` line) is held the same way, so it
+        # survives an unrelated edit. Every further line is an addition and goes
+        # through the one lookup, which refuses a shared name rather than pick.
+        held: dict[str, list[str]] = {}
+        for line, uid in zip(lines, current_uids, strict=True):
+            held.setdefault(line.strip(), []).append(uid)
+        taken: dict[str, int] = {}
         new_uid_list = []
         for name in new_names.split("\n"):
             name = name.strip()
             if not name:
                 continue
-            uid = name_to_uid.get(name.lower())
-            if uid:
-                new_uid_list.append(uid)
-            else:
-                return _text(f"Error: Category '{name}' not found in Paprika — cannot convert back to UUID. No changes were saved.")
+            k = taken.get(name, 0)
+            taken[name] = k + 1
+            if k < len(held.get(name, [])):
+                new_uid_list.append(held[name][k])
+                continue
+            try:
+                new_uid_list.append(resolve_category(categories_info["all"], name, create_hint=True)["uid"])
+            except CategoryRefused as r:
+                return _text(f"{r} No changes were saved.")
+
+        # Pairing by count cannot say WHICH of two same-named lines went: a
+        # recipe in both *Thai*s whose first *Thai* line is removed would keep
+        # the first held uid and drop the second — the opposite of what was
+        # asked, silently. So when a text the recipe holds more than once is
+        # left fewer times but not removed altogether, refuse (051 code review).
+        for text, uids in held.items():
+            # Two copies of ONE uid (which the old de-dup-free edit could leave)
+            # are not ambiguous: whichever line goes, the same category stays.
+            if len(set(uids)) > 1 and 0 < taken.get(text, 0) < len(uids):
+                return _text(AMBIGUOUS_REMOVAL.format(name=recipe.name, k=len(uids), text=text))
+
+        # An addition can resolve to a uid the recipe already holds (another
+        # case, or the id itself); a recipe listed in one category twice shows
+        # it twice in the apps, so keep the first of each.
+        new_uid_list = list(dict.fromkeys(new_uid_list))
 
         recipe.categories = new_uid_list
-        return _upload(remote, recipe, f"Successfully updated categories in recipe '{recipe.name}' (ID: {recipe_id})\n\nOld categories:\n{current_names}\n\nNew categories:\n{new_names}")
+        # Shown from the uids saved, not the edited text: after de-duplication
+        # "Dinner" and Dinner's id are one category, and the answer must not
+        # list it twice (051 code review).
+        saved = "\n".join(uid_to_name.get(uid, f"Unknown-{uid[:8]}") for uid in new_uid_list)
+        return _upload(remote, recipe, f"Successfully updated categories in recipe '{recipe.name}' (ID: {recipe_id})\n\nOld categories:\n{current_names}\n\nNew categories:\n{saved}")
 
     # A text field Paprika sent as null is empty, and an empty find fills it.
     field_value = getattr(recipe, field) or ""

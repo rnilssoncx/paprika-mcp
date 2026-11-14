@@ -4,7 +4,7 @@ from typing import Any
 
 from mcp.types import TextContent
 
-from ..utils import CategoriesUnavailable, get_categories, get_remote
+from ..utils import CategoriesUnavailable, get_categories, get_remote, normalize_string
 
 
 def list_categories_tool(args: dict[str, Any]) -> list[TextContent]:
@@ -26,8 +26,8 @@ def list_categories_tool(args: dict[str, Any]) -> list[TextContent]:
     categories.sort(key=lambda c: c.get("name", "").lower())
 
     # Build hierarchical structure
-    root_categories = []
-    child_categories = {}
+    root_categories: list[dict[str, Any]] = []
+    child_categories: dict[str, list[dict[str, Any]]] = {}
 
     for cat in categories:
         parent_uid = cat.get("parent_uid")
@@ -66,14 +66,21 @@ def list_categories_tool(args: dict[str, Any]) -> list[TextContent]:
     # Also add a flat list at the end for easy reference
     output_lines.append("\n## Flat List (for reference):")
     categories_by_uid = {c["uid"]: c for c in categories}
-    for cat in categories:
+    # A name two categories share cannot be given to any tool, which refuses it
+    # and asks for an id — so the id is shown beside exactly those names, here
+    # and not in the tree. Compared as the lookup compares (case and accents
+    # ignored). Unique names keep their old line.
+    folded = [normalize_string(c.get("name") or "") for c in categories]
+    for cat, key in zip(categories, folded, strict=True):
         name = cat.get("name", "Unnamed")
+        shared = bool(key) and folded.count(key) > 1
         parent_uid = cat.get("parent_uid")
         if parent_uid:
             parent_name = categories_by_uid.get(parent_uid, {}).get("name", "Unknown")
-            output_lines.append(f"- {name} (Parent: {parent_name})")
+            detail = f"Parent: {parent_name}, id {cat['uid']}" if shared else f"Parent: {parent_name}"
         else:
-            output_lines.append(f"- {name}")
+            detail = f"id {cat['uid']}" if shared else ""
+        output_lines.append(f"- {name} ({detail})" if detail else f"- {name}")
 
     return [TextContent(type="text", text="\n".join(output_lines))]
 

@@ -1,6 +1,7 @@
 """Utility functions for paprika-mcp server."""
 
 import contextlib
+import gzip
 import json
 import logging
 import os
@@ -280,7 +281,13 @@ def get_categories(remote: Remote) -> dict[str, Any]:
             — never an empty result standing in for one.
     """
     try:
-        categories = remote._request("get", "/api/v2/sync/categories/").json().get("result", [])
+        body = remote._request("get", "/api/v2/sync/categories/").json()
+        # A 200 with no `result` list is not "no categories": read as one, it
+        # let create_category pass the taken-name check against nothing (051
+        # code review).
+        if not isinstance(body, dict) or not isinstance(body.get("result"), list):
+            raise ValueError(f"Paprika answered {body!r}")
+        categories = body["result"]
     except Exception as e:
         logger.warning(f"Failed to fetch categories: {e}")
         raise CategoriesUnavailable(f"Could not fetch categories from Paprika ({type(e).__name__}: {e})") from e
@@ -302,6 +309,128 @@ def get_categories(remote: Remote) -> dict[str, Any]:
         "all": categories,
         "by_uid": by_uid,
     }
+
+
+class CategoryRefused(Exception):
+    """A category request the tools will not carry out; the message is the answer.
+
+    Raised by the lookup and by the pure `decide_*` functions of the category
+    tools, and caught by the handlers, which return it as text. A separate class
+    from meal_plan's `Refused` and create_recipe's `Refused` on purpose: the
+    modules never share a catch, and an `except Refused` in one must not read as
+    covering another.
+    """
+
+
+# The lookup's sentences — contract, tests assert them (moneypenny plans/051
+# § The words). Two forms of "unknown": a tool that can also create a category
+# says so, one that cannot does not promise it.
+UNKNOWN_CATEGORY_CREATE = 'Error: No category is named "{given}". Use list_categories to see them, or create_category to add it.'
+UNKNOWN_CATEGORY = 'Error: No category is named "{given}". Use list_categories to see them.'
+SHARED_CATEGORY = 'Error: "{given}" names {n} categories: {each}. Name one by its id.'
+BAD_CATEGORY_NAME = (
+    "Error: A category name must be on one line, with no control characters, and not empty; got {why}. "
+    "Nothing was changed."
+)
+
+
+def _parent_name(cat: dict[str, Any], categories_all: list[dict[str, Any]]) -> str:
+    parent_uid = cat.get("parent_uid")
+    for c in categories_all:
+        if c.get("uid") == parent_uid:
+            return str(c.get("name") or "")
+    # A parent the account no longer has: say so rather than invent a name.
+    return f"Unknown-{str(parent_uid)[:8]}"
+
+
+def describe_category(cat: dict[str, Any], categories_all: list[dict[str, Any]]) -> str:
+    """`"Thai" (id X, top level)` or `"Thai" (id X, under "Ethnic")`: the id is in the answer itself."""
+    where = f'under "{_parent_name(cat, categories_all)}"' if cat.get("parent_uid") else "top level"
+    return f'"{cat.get("name")}" (id {cat["uid"]}, {where})'
+
+
+def resolve_category(categories_all: list[dict[str, Any]], given: str, *, create_hint: bool) -> dict[str, Any]:
+    """The one category `given` names, or CategoryRefused saying why not.
+
+    The one lookup for create_recipe, update_recipe and all four category tools
+    (for `category` and `parent` alike): a second copy is how one tool comes to
+    pick the first of two *Thai*s while another refuses. An id wins, compared
+    case-insensitively as `find_menu` treats menu ids, because it is the only
+    way to name one of two categories that share a name. Otherwise every
+    category whose name equals `given` under normalize_string: one is the
+    answer; none or two are refused, and the refusal for two carries each id.
+
+    Runs over `categories_all`, not `by_uid`/`name_to_uid`, which skip a
+    category with an empty name and keep only the last of two shared names.
+    `create_hint` is whether the calling tool can send the member to
+    create_category.
+    """
+    given = given.strip()
+    by_id = [c for c in categories_all if str(c.get("uid", "")).lower() == given.lower() and given]
+    if by_id:
+        return by_id[0]
+    wanted = normalize_string(given)
+    named = [c for c in categories_all if wanted and normalize_string(c.get("name") or "") == wanted]
+    if len(named) == 1:
+        return named[0]
+    if not named:
+        raise CategoryRefused((UNKNOWN_CATEGORY_CREATE if create_hint else UNKNOWN_CATEGORY).format(given=given))
+    each = ", ".join(describe_category(c, categories_all) for c in named)
+    raise CategoryRefused(SHARED_CATEGORY.format(given=given, n=len(named), each=each))
+
+
+def check_category_name(name: Any) -> str:
+    """A category name stripped, or CategoryRefused: empty, or with a control character.
+
+    Any character in Unicode categories Cc, Zl or Zp is refused — that is every
+    character `str.splitlines()` splits on (\\n, \\r, \\x0b, \\x0c, \\x1c-\\x1e, \\x85,
+    U+2028, U+2029), which would break `update_recipe`'s one-name-per-line edit
+    of a recipe's categories, and the rest of the control characters with them.
+    Stripped first, so a trailing newline is not a refusal. No length bound: a
+    long name harms nothing and is renamed.
+    """
+    text = name.strip() if isinstance(name, str) else ""
+    if not text:
+        raise CategoryRefused(BAD_CATEGORY_NAME.format(why="an empty name"))
+    for ch in text:
+        if unicodedata.category(ch) in ("Cc", "Zl", "Zp"):
+            raise CategoryRefused(
+                BAD_CATEGORY_NAME.format(why=f"a line break or control character (U+{ord(ch):04X})")
+            )
+    return text
+
+
+def post_categories(remote: Remote, items: list[dict[str, Any]]) -> None:
+    """Write categories — whole objects, upserted by uid — and require `result: true`.
+
+    As the meal planner's writes: a gzip-compressed JSON array as the multipart
+    field `data`, through the Remote's own `_request` (the app's User-Agent,
+    retries, error parsing). `_request` raises on an HTTP error or an `error`
+    key, but a 200 answering `{"result": false}` would pass it, and reading any
+    200 as success is reporting a write nobody can vouch for. Anything but
+    `true` raises, and the caller words it as *can't tell*.
+    """
+    body = gzip.compress(json.dumps(items).encode())
+    answer = remote._request("post", "/api/v2/sync/categories/", files={"data": ("data", body)}).json()
+    if not (isinstance(answer, dict) and answer.get("result") is True):
+        raise RequestError(f"Paprika answered {answer!r}")
+
+
+def all_recipes(remote: Remote) -> list[Any]:
+    """Every recipe, live and trashed, or an exception — never a short list.
+
+    The library's own walk (`Remote.recipes`) reads the list with
+    `.get("result", [])`, so a 200 answered without `result` walks nothing, and
+    a check that counts recipes reads "none". delete_category counts the
+    recipes in a category before deleting it, and a count of nothing there
+    deletes a category recipes are still in (051 code review). So the list is
+    read here and its `result` required; each recipe still comes through the
+    library's cached `get_recipe_by_id`, and any failure there raises too.
+    """
+    body = remote._request("get", "/api/v2/sync/recipes/").json()
+    if not isinstance(body, dict) or not isinstance(body.get("result"), list):
+        raise RequestError(f"Paprika answered {body!r}")
+    return [remote.get_recipe_by_id(i["uid"], i["hash"]) for i in body["result"]]
 
 
 def translate_category_uids(uids: list[str], uid_to_name: dict[str, str]) -> str:
