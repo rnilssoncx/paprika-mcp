@@ -1,5 +1,7 @@
 """Tools module - exports all MCP tool implementations."""
 
+from ..upload_probe import TOOL_DEFINITION as PHOTO_PROBE_DEF  # THROWAWAY: 053 S3
+from ..upload_probe import link_tool as photo_probe_link_tool  # THROWAWAY: 053 S3
 from .categories import (
     CREATE_CATEGORY_DEF,
     DELETE_CATEGORY_DEF,
@@ -76,6 +78,7 @@ TOOLS = {
     "remove_meal": {"definition": REMOVE_MEAL_DEF, "handler": remove_meal_tool},
     "list_menus": {"definition": LIST_MENUS_DEF, "handler": list_menus_tool},
     "plan_menu": {"definition": PLAN_MENU_DEF, "handler": plan_menu_tool},
+    "photo_probe_link": {"definition": PHOTO_PROBE_DEF, "handler": photo_probe_link_tool},  # THROWAWAY: 053 S3
 }
 
 __all__ = [
