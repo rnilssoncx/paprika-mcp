@@ -25,9 +25,6 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 
 from .server import app as mcp_server
-from .upload_probe import (
-    upload as upload_probe,  # THROWAWAY: moneypenny plans/053 spike S3
-)
 
 
 def build(settings: Settings) -> HubGate:
@@ -66,9 +63,7 @@ def build(settings: Settings) -> HubGate:
             yield
 
     inner = Starlette(
-        routes=[Route(settings.path, endpoint=Endpoint(), methods=["GET", "POST", "DELETE"]),
-                # THROWAWAY (053 S3): the token is its only lock; see upload_probe.py.
-                Route("/upload/{token}", endpoint=upload_probe, methods=["PUT"])],
+        routes=[Route(settings.path, endpoint=Endpoint(), methods=["GET", "POST", "DELETE"])],
         lifespan=lifespan,
     )
     inner.router.redirect_slashes = False

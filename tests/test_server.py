@@ -47,7 +47,6 @@ CALLS = {
     "remove_meal": {"meal_id": "X"},
     "list_menus": {},
     "plan_menu": {"menu": "Feast", "start_date": "2026-10-26"},
-    "photo_probe_link": {},  # THROWAWAY: moneypenny plans/053 S3
 }
 
 
@@ -78,8 +77,7 @@ async def test_every_advertised_tool_reaches_its_handler(offline):
             # Reaching Paprika is where each handler first does real work, so
             # the offline error proves the call got that far — not swallowed by
             # the dispatcher, refused as unknown, or rejected by the schema.
-            expected = {"format_fraction": "Formatted fraction: ¼",
-                        "photo_probe_link": "Upload link"}.get(name, f"Error: {OFFLINE}")  # probe: THROWAWAY, 053 S3
+            expected = "Formatted fraction: ¼" if name == "format_fraction" else f"Error: {OFFLINE}"
             assert text.startswith(expected), (name, text)
 
 
