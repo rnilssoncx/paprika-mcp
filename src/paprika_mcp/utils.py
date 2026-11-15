@@ -18,6 +18,8 @@ from paprika_recipes.cache import DirectoryCache
 from paprika_recipes.exceptions import PaprikaError, RequestError
 from paprika_recipes.remote import Remote
 
+from .credentials import TITLE, VAULT_TITLE, accepted, get_credentials, rejected
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -143,77 +145,33 @@ class _SharedDirectoryCache(DirectoryCache):
             self._write("index.json", self.index)
 
 
-def get_credentials() -> tuple[str, str]:
-    """Get Paprika credentials from environment variables or config file.
-
-    Priority:
-    1. PAPRIKA_EMAIL and PAPRIKA_PASSWORD environment variables
-    2. ~/.paprika-mcp/config.json file
-
-    Raises:
-        ValueError: If credentials are not configured
-    """
-    # Check environment variables first
-    email = os.environ.get("PAPRIKA_EMAIL")
-    password = os.environ.get("PAPRIKA_PASSWORD")
-
-    if email and password:
-        return email, password
-
-    # Check config file
-    config_path = os.path.expanduser("~/.paprika-mcp/config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                config = json.load(f)
-                email = config.get("email")
-                password = config.get("password")
-                if email and password:
-                    return email, password
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning(f"Failed to read config file: {e}")
-
-    raise ValueError(
-        "Paprika credentials not found. Set PAPRIKA_EMAIL and PAPRIKA_PASSWORD "
-        "environment variables, or create ~/.paprika-mcp/config.json with "
-        '{"email": "your@email.com", "password": "yourpassword"}'
-    )
-
-
 def get_user_agent() -> str | None:
-    """Get User-Agent string from environment or config file.
+    """Get the User-Agent string from the environment.
 
-    Priority:
-    1. PAPRIKA_USER_AGENT environment variable
-    2. user_agent field in ~/.paprika-mcp/config.json
-
-    Note: If not configured here, the Remote class will auto-detect from
-    the installed Paprika app.
+    `PAPRIKA_USER_AGENT` is the Mac app's version string, not a secret, and stays in the
+    server's env file. If it is not set, the Remote class will auto-detect from the installed
+    Paprika app. `~/.paprika-mcp/config.json` is no longer read (moneypenny plan 039, order 4).
 
     Returns:
         User-Agent string or None (which triggers auto-detection in Remote)
     """
-    # Check environment variable first
-    user_agent = os.environ.get("PAPRIKA_USER_AGENT")
-    if user_agent:
-        return user_agent
-
-    # Check config file
-    config_path = os.path.expanduser("~/.paprika-mcp/config.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path) as f:
-                config = json.load(f)
-                user_agent = config.get("user_agent")
-                if user_agent:
-                    return user_agent
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning(f"Failed to read user_agent from config file: {e}")
-
-    return None
+    return os.environ.get("PAPRIKA_USER_AGENT") or None
 
 
-def get_remote() -> Remote:
+STALE_AGENT = (
+    "Paprika did not accept this server's User-Agent, which is stale after a Paprika app update. "
+    "Run `secrets-env.py paprika` on the Mac again and redeploy. The password is not the problem."
+)
+
+
+def _scrub(text: str, held: Any) -> str:
+    """`text` with the password and the email taken out, whatever their case."""
+    for value, name in ((held.secret, "[password]"), (held.username, "[email]")):
+        text = re.sub(re.escape(value), name, text, flags=re.IGNORECASE)
+    return text
+
+
+def get_remote(quiet: bool = False) -> Remote:
     """Get authenticated Remote instance using stored credentials.
 
     The Remote class uses a DirectoryCache to store recipe data locally:
@@ -226,12 +184,17 @@ def get_remote() -> Remote:
     Note: Remote.recipes is a generator that makes API calls. If you need to
     iterate multiple times or access by index, convert to list first.
 
+    The login is read from the `Paprika` item in the vault copy on each call
+    (credentials.py), **outside** the `try` below: `CredentialsUnavailable` carries
+    039's words and must not be rewrapped into a sentence about a password.
+    `quiet` is the nightly export's read, which has no `/want` to raise the flag in.
+
     Raises:
-        ValueError: If credentials are not configured
+        CredentialsUnavailable: If the item cannot be read (not a PaprikaError)
         PaprikaError: If authentication fails (check credentials)
         RequestError: If API request fails (network/server issue)
     """
-    email, password = get_credentials()
+    held = get_credentials(quiet=quiet)
     user_agent = get_user_agent()
 
     # Use cache to avoid re-downloading recipes
@@ -241,17 +204,36 @@ def get_remote() -> Remote:
 
     try:
         # Use 30 second timeout to prevent hanging on network issues
-        remote = Remote(email, password, cache=cache, user_agent=user_agent, timeout=30)
+        remote = Remote(held.username, held.secret, cache=cache, user_agent=user_agent, timeout=30)
         # Test authentication by accessing bearer_token
         _ = remote.bearer_token
+        # A refused verdict held for this version is stale if the login works: the watcher
+        # tests it again (at most once an hour).
+        accepted(held.version)
         return remote
     except (PaprikaError, RequestError) as e:
-        api_msg = str(e) or "unknown error"
+        text = str(e)
+        if "unrecognized client" in text.lower():
+            # A stale User-Agent after a Paprika app update, never the password: no re-test, and
+            # words that do not send anyone to 1Password.
+            raise type(e)(STALE_AGENT) from None
+        # Ask the watcher to test this version of the item again (at most once an hour): a
+        # password changed in Paprika but not in 1Password must reach the Credentials page.
+        rejected(held.version)
+        # The library's text can quote the login's answer, which can echo the email. Its
+        # "no token" message is dropped for the one fact it carries; any other message is the
+        # server's own and is kept with both values taken out, whatever their case. The chain is
+        # dropped (`from None`) because the original holds the unscrubbed text and
+        # `server.call_tool` logs the traceback.
+        if text.startswith("No bearer token found in response"):
+            api_msg = "the login answer held no token"
+        else:
+            api_msg = _scrub(text or "unknown error", held)
         raise type(e)(
             f"Paprika authentication failed: {api_msg}. "
-            "Verify email and password in ~/.paprika-mcp/config.json "
-            "or PAPRIKA_EMAIL/PAPRIKA_PASSWORD environment variables."
-        ) from e
+            f"Check the {TITLE} item in {VAULT_TITLE} in 1Password; "
+            "an edit is picked up at the fetcher's next sync."
+        ) from None
     except Exception as e:
         logger.error(f"Failed to connect to Paprika API: {e}", exc_info=True)
         raise

@@ -10,6 +10,7 @@ from fakes import RecipeRemote, category
 from paprika_recipes.remote import RemoteRecipe
 
 from paprika_mcp import utils
+from paprika_mcp.credentials import Held
 from paprika_mcp.tools import TOOLS
 from paprika_mcp.tools import list_categories as lc
 from paprika_mcp.tools import read_recipe as rr
@@ -225,7 +226,7 @@ def test_get_remote_uses_the_shared_cache(monkeypatch, tmp_path):
         bearer_token = "tok"
 
     monkeypatch.setattr(utils, "Remote", Remote)
-    monkeypatch.setattr(utils, "get_credentials", lambda: ("e", "p"))
+    monkeypatch.setattr(utils, "get_credentials", lambda quiet=False: Held("i", "u", "e", "p"))
     monkeypatch.setattr(utils, "get_user_agent", lambda: None)
     monkeypatch.setattr(utils.os.path, "expanduser", lambda path: str(tmp_path / "cache"))
     utils.get_remote()

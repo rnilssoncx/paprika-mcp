@@ -50,51 +50,13 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-### 3. Configure credentials
+### 3. Credentials
 
-**Option 1: Interactive setup**
-
-```bash
-source .venv/bin/activate
-paprika-mcp setup
-```
-
-**Option 2: Manual config file**
-
-Create `~/.paprika-mcp/config.json`:
-
-```json
-{
-  "email": "your@email.com",
-  "password": "yourpassword"
-}
-```
-
-Set permissions:
-```bash
-chmod 600 ~/.paprika-mcp/config.json
-```
-
-**Option 3: Environment variables**
-
-```bash
-export PAPRIKA_EMAIL="your@email.com"
-export PAPRIKA_PASSWORD="yourpassword"
-```
-
-## Credential Management
-
-The server uses a credential flow designed for MCP stdio transport:
-
-**Priority order:**
-1. `PAPRIKA_EMAIL` and `PAPRIKA_PASSWORD` environment variables
-2. `~/.paprika-mcp/config.json` file
-
-**Note**: This server manages credentials independently from the paprika-recipes CLI tool's keyring storage. This simplifies the credential flow for MCP stdio transport where the process is spawned by the AI app.
+The login is the `Paprika` item in the household's Services vault (moneypenny plan 039): the email is the item's username and the password its `password` field, copied into a read-only mount at `/vault` (`PAPRIKA_VAULT_DIR`) by the vault's fetcher and read on each call. `PAPRIKA_EMAIL`, `PAPRIKA_PASSWORD` and `~/.paprika-mcp/config.json` are no longer read, and the `paprika-mcp setup` command is gone. Run by hand on a machine with no vault copy (stdio mode), every tool answers that it cannot read its credentials yet.
 
 ## User-Agent
 
-If you have Paprika for Mac installed, the fork of the `paprika-recipes` Python package should automatically create a suitable User-Agent string. Otherwise, you might have to set the `PAPRIKA_USER_AGENT` environment variable or the "user_agent" property in `config.json`.
+If you have Paprika for Mac installed, the fork of the `paprika-recipes` Python package should automatically create a suitable User-Agent string. Otherwise, set the `PAPRIKA_USER_AGENT` environment variable (not a secret).
 
 ## Usage
 
@@ -107,22 +69,6 @@ Add to your MCP client configuration (e.g., Claude Desktop's `~/Library/Applicat
   "mcpServers": {
     "paprika": {
       "command": "/Users/yourusername/Developer/paprika-mcp/.venv/bin/paprika-mcp"
-    }
-  }
-}
-```
-
-Or use environment variables:
-
-```json
-{
-  "mcpServers": {
-    "paprika": {
-      "command": "/Users/yourusername/Developer/paprika-mcp/.venv/bin/paprika-mcp",
-      "env": {
-        "PAPRIKA_EMAIL": "your@email.com",
-        "PAPRIKA_PASSWORD": "yourpassword"
-      }
     }
   }
 }
@@ -278,8 +224,7 @@ npm install
 
 ## Security Notes
 
-- Credentials are stored in plain text in `~/.paprika-mcp/config.json`
-- Environment variables (`PAPRIKA_EMAIL`, `PAPRIKA_PASSWORD`) are also supported
+- The server holds no credential in its environment or in a file of its own: the login is read from the vault copy on each call
 
 ## License
 

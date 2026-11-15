@@ -18,6 +18,7 @@ UTC and the household's is not.
 """
 
 import datetime
+import functools
 import gzip
 import hashlib
 import json
@@ -206,7 +207,9 @@ def main(
         print(f"paprika export: refused: EXPORT_DATE must be YYYY-MM-DD, got {date!r}", file=sys.stderr)
         return 2
     try:
-        remote = (remote_factory or get_remote)()
+        # Quietly: the export container has no `/want`, so it could not raise the flag. Before the
+        # first sync the read still fails in the vault's own words, which is a failed run.
+        remote = (remote_factory or functools.partial(get_remote, quiet=True))()
         document = collect(remote, day)
         reason = problem(document)
         if reason:

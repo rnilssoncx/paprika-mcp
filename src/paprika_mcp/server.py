@@ -8,6 +8,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Prompt, Tool
 
+from .credentials import CredentialsUnavailable
 from .prompts import PROMPTS
 from .tools import TOOLS
 
@@ -53,6 +54,13 @@ async def call_tool(name: str, arguments: dict):
     if name in TOOLS:
         try:
             return await anyio.to_thread.run_sync(TOOLS[name]["handler"], arguments)
+        except CredentialsUnavailable as e:
+            # One line and no traceback: this is the vault's own sentence, not a fault, and a
+            # request made before the first sync is expected for up to a minute after a recreate.
+            logger.warning("Error in %s: %s", name, type(e).__name__)
+            from mcp.types import TextContent
+
+            return [TextContent(type="text", text=f"Error: {e}")]
         except Exception as e:
             logger.error(f"Error in {name}: {e}", exc_info=True)
             from mcp.types import TextContent

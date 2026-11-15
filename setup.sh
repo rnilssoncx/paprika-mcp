@@ -59,33 +59,6 @@ else
     echo "Install Node.js and run 'npm install' to enable pre-commit hooks."
 fi
 
-# Set up credentials
-echo ""
-echo "Step 4: Configure Paprika credentials..."
-CONFIG_DIR="$HOME/.paprika-mcp"
-CONFIG_FILE="$CONFIG_DIR/config.json"
-
-mkdir -p "$CONFIG_DIR"
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo ""
-    echo "Enter your Paprika account credentials:"
-    read -p "Email: " PAPRIKA_EMAIL
-    read -s -p "Password: " PAPRIKA_PASSWORD
-    echo ""
-    
-    cat > "$CONFIG_FILE" << EOF
-{
-  "email": "$PAPRIKA_EMAIL",
-  "password": "$PAPRIKA_PASSWORD"
-}
-EOF
-    chmod 600 "$CONFIG_FILE"
-    echo "✓ Credentials saved to $CONFIG_FILE"
-else
-    echo "✓ Credentials already configured at $CONFIG_FILE"
-fi
-
 echo ""
 echo "✓ Setup complete!"
 echo ""
@@ -98,6 +71,3 @@ echo "   paprika-mcp"
 echo ""
 echo "3. Configure your MCP client (e.g., Claude Desktop) with:"
 echo "   Command: $PWD/.venv/bin/paprika-mcp"
-echo ""
-echo "Credentials are stored in: $CONFIG_FILE"
-echo "You can also set PAPRIKA_EMAIL and PAPRIKA_PASSWORD environment variables."
