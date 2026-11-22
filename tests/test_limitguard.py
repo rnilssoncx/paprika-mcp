@@ -51,6 +51,11 @@ def test_tags_valid_and_registered() -> None:
     assert not (problems := lg.check_tags(CONFIG)), fail_text(problems)
 
 
+def test_limits_read() -> None:
+    """080: every declared limit is read, and read where it is used (`lg.read_problems`)."""
+    assert not (problems := lg.read_problems(CONFIG)), fail_text(problems)
+
+
 # -- what the detector sees ----------------------------------------------------------------------
 
 FOUND = [
@@ -374,7 +379,7 @@ def test_mutation_05_a_tag_with_a_one_word_reason(repo: Repo) -> None:
 def test_mutation_06_a_tag_of_an_unknown_kind(repo: Repo) -> None:
     repo.replace("pkg/a.py", "limit-ok: format", "limit-ok: whatever")
     found = repo.problems()
-    assert any("`whatever` is not one of maximum, reply-bound, format, not-a-limit" in m
+    assert any("`whatever` is not one of maximum, reply-bound, format, not-a-limit, pi-guard" in m
                for m in found["tags"])
 
 
@@ -626,7 +631,7 @@ def test_summary_line_counts_the_list_and_the_tags(repo: Repo) -> None:
     repo.append("tests/limitguard-todo.txt", "pkg/a.py | an anchor\n")
     assert lg.summary_line(repo.cfg.guard_dir) == (
         "limits not yet converted: 3 (hits 2, hand-found 1); "
-        "tags: format 1, maximum 0, not-a-limit 0, reply-bound 0"
+        "tags: format 1, maximum 0, not-a-limit 0, pi-guard 0, reply-bound 0"
     )
 
 
@@ -639,6 +644,279 @@ def test_no_list_line_holds_a_string_from_source() -> None:
     keys += [" | ".join(ln.split(" | ")[:4]) for ln in tags]
     for key in keys:
         assert not set("\"'`") & set(key.replace(lg.PLACEHOLDER, "")), key
+
+
+# -- a cap that protects another machine (080: `pi-guard`) ---------------------------------------
+
+PI_REASON = "limit-ok: pi-guard — a cap that holds when the Pi is broken into"
+
+
+def pi_guard_repo(repo: Repo, guards: tuple[str, ...]) -> Repo:
+    repo.cfg = lg.Config(root=repo.root, guard_dir=repo.root / "tests", text_roots=("web/",),
+                         reply_bound=frozenset({"pkg/reader.py"}), pi_guards=guards)
+    return repo
+
+
+def pi_tagged(repo: Repo, path: str) -> list[str]:
+    """The tag problems of `TIMEOUT_SECONDS = 30` with a registered `pi-guard` tag at `path`."""
+    repo.write(path, f"TIMEOUT_SECONDS = 30  # {PI_REASON}\n")
+    repo.append("tests/limitguard-tags.txt", f"{path} | <module> | TIMEOUT_SECONDS = | 30 | "
+                "pi-guard | a cap that holds when the Pi is broken into\n")
+    return lg.check_tags(repo.cfg)
+
+
+def test_pi_guard_counts_under_a_configured_path_and_is_registered_like_any_tag(repo: Repo) -> None:
+    pi_guard_repo(repo, ("walt/",))
+    assert pi_tagged(repo, "walt/server.py") == []
+    assert [m for m in lg.check_new(repo.cfg) if "walt/" in m] == []
+    assert "pi-guard 1" in lg.summary_line(repo.cfg.guard_dir)
+
+
+def test_pi_guard_is_refused_outside_the_configured_path_in_words_naming_it(repo: Repo) -> None:
+    pi_guard_repo(repo, ("walt/",))
+    found = pi_tagged(repo, "pkg/b.py")
+    [message] = [m for m in found if "does not count" in m]
+    assert any("line with no matching tag" in m for m in found)  # a refused tag is no tag
+    assert "the `pi-guard` tag does not count" in message
+    assert "`pi-guard` counts only under `walt/` (Config.pi_guards)" in message
+    assert "cannot be where it is set" in message
+    assert any("pkg/b.py" in m and "TIMEOUT_SECONDS = 30" in m for m in lg.check_new(repo.cfg))
+
+
+def test_pi_guard_with_no_configured_path_counts_nowhere_not_everywhere(repo: Repo) -> None:
+    # Kills: an empty tuple read as "no restriction", which would let every repository tag one.
+    pi_guard_repo(repo, ())
+    for path in ("pkg/b.py", "walt/server.py"):
+        [message] = [m for m in pi_tagged(repo, path) if "does not count" in m]
+        assert "counts only under no path in this repository" in message, path
+        repo.write(path, "")  # clear for the next, with its registry line removed below
+        repo.write("tests/limitguard-tags.txt", "pkg/a.py | <module> | TAGGED = | 998 | format | "
+                   "a fact of the format\n")
+
+
+@pytest.mark.parametrize("path", ["waltz/server.py", "walt/../pi/server.py", "walt.py",
+                                  "pi/walt/server.py", "./pkg/b.py"])
+def test_pi_guard_is_matched_on_the_normalised_path_whole_not_by_prefix(
+        repo: Repo, path: str) -> None:
+    # Kills: `startswith("walt")`, a match that ignores `..`, and one that matches a segment
+    # anywhere in the path.
+    pi_guard_repo(repo, ("walt/",))
+    hit = lg.Hit(path, 1, "<module>", "X =", "30", "X", lg.Tag(1, "pi-guard", "three words here"))
+    assert "counts only under `walt/`" in (lg.tag_problem(hit, lg.Found(), repo.cfg) or "")
+
+
+def test_pi_guard_is_matched_after_normalising_a_path_that_goes_down_and_back(repo: Repo) -> None:
+    pi_guard_repo(repo, ("walt/",))
+    hit = lg.Hit("walt/sub/../server.py", 1, "<module>", "X =", "30", "X",
+                 lg.Tag(1, "pi-guard", "three words here"))
+    assert lg.tag_problem(hit, lg.Found(), repo.cfg) is None
+
+
+# -- the read check (080) --------------------------------------------------------------------------
+
+DECLARED = ("from control.limits import Limit\n\n"
+            "CAP = Limit('cap_a', 'A cap', 'count', 'household', 'hour', {'-': 5}, {'-': 9})\n"
+            "LIMITS = (CAP,)\n")
+
+
+def reading(repo: Repo, files: dict[str, str], **cfg: object) -> list[str]:
+    """The read check over `files` written into the base repository, with `cfg` on the Config."""
+    for path, text in files.items():
+        repo.write(path, text)
+    repo.cfg = lg.Config(root=repo.root, guard_dir=repo.root / "tests", text_roots=("web/",),
+                         reply_bound=frozenset({"pkg/reader.py"}), **cfg)  # type: ignore[arg-type]
+    return lg.read_problems(repo.cfg)
+
+
+def test_the_base_repository_declares_nothing_so_nothing_is_unread(repo: Repo) -> None:
+    assert reading(repo, {}) == []
+
+
+def test_a_declared_limit_that_nothing_reads_is_said_with_its_file_line_and_name(
+        repo: Repo) -> None:
+    # Kills: a check that passes a limit because it is declared and listed in a tuple.
+    [message] = reading(repo, {"pkg/limits_here.py": DECLARED})
+    assert message.startswith("pkg/limits_here.py:3: the limit `cap_a` is declared and never read")
+
+
+@pytest.mark.parametrize("read", [
+    "limits.value('cap_a')",
+    "limits.value('cap_a', 'duet')",
+    "self._limits.value(CAP.name)",
+    "limits.at_start('cap_a')",
+    "value_in_force(CAP, '-', None, now)",
+])
+def test_a_read_that_names_the_limit_passes_it(repo: Repo, read: str) -> None:
+    # Kills: a reader that insists on one spelling of the call.
+    use = ("from pkg.limits_here import CAP\n\n\ndef use(limits, now, self=None):\n"
+           f"    return {read}\n")
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use}) == []
+
+
+def test_a_name_in_a_call_that_is_not_a_read_does_not_pass_it(repo: Repo) -> None:
+    # Kills: any mention of the name counting, a log line or a dict key included.
+    use = "def use(log):\n    log.info('cap_a')\n    return {'cap_a': 1}\n"
+    [message] = reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use})
+    assert "`cap_a` is declared and never read" in message
+
+
+def test_a_helper_that_reads_through_a_limit_passes_the_constants_it_is_given(repo: Repo) -> None:
+    # Kills: a check that cannot see a read made through `Budget(LIMIT)` and `value(limit.name)`.
+    use = ("from pkg.limits_here import CAP\n\n\nclass Budget:\n"
+           "    def __init__(self, limit, limits):\n"
+           "        self.limit, self.limits = limit, limits\n\n"
+           "    def left(self):\n        return self.limits.value(self.limit.name)\n\n\n"
+           "def build(limits):\n    return (Budget(CAP, limits), Budget(CAP, limits))\n")
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use}) == []
+
+
+def test_a_constant_only_listed_is_unread_however_many_reads_there_are_elsewhere(
+        repo: Repo) -> None:
+    # Kills: a generic read anywhere blanket-approving every declared limit.
+    declared = DECLARED + ("OTHER = Limit('cap_b', 'B', 'count', 'household', 'hour', {'-': 5}, "
+                           "{'-': 9})\nALL = (CAP, OTHER)\n")
+    use = ("from pkg.limits_here import CAP\n\n\ndef left(limits, limit):\n"
+           "    return limits.value(limit.name)\n\n\ndef go(limits):\n"
+           "    return left(limits, CAP)\n")
+    [message] = reading(repo, {"pkg/limits_here.py": declared, "pkg/use.py": use})
+    assert "`cap_b` is declared and never read" in message
+
+
+def test_a_constant_used_inside_a_call_inside_a_tuple_is_used(repo: Repo) -> None:
+    # Kills: a listing test that treats the whole tuple as a listing (a calendar's two budgets).
+    use = ("from pkg.limits_here import CAP\n\n\ndef build(make, limits):\n"
+           "    return (make(CAP), limits.value(CAP.name))\n")
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use}) == []
+    helper = "def make(limit, limits):\n    return limits.value(limit.name)\n"
+    only_made = ("from pkg.limits_here import CAP\n\n\ndef build(make):\n"
+                 "    return (make(CAP), 2)\n")
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": only_made,
+                          "pkg/helper.py": helper}) == []
+
+
+def test_an_inline_declaration_is_read_through_a_generic_read(repo: Repo) -> None:
+    # Kills: a limit built inline in a dict (no constant) always reported unread, and one reported
+    # read with no read at all.
+    declared = ("TABLE = {'a': Limit('cap_a', 'A', 'count', 'household', 'hour', {'-': 5}, "
+                "{'-': 9})}\n")
+    use = "def left(limits, kind):\n    return limits._value(TABLE[kind].name)\n"
+    assert reading(repo, {"pkg/limits_here.py": declared, "pkg/use.py": use}) == []
+    [message] = reading(repo, {"pkg/use.py": "def left():\n    return 3\n"})
+    assert "`cap_a` is declared and never read" in message
+
+
+def test_a_value_helper_with_no_limit_in_its_arguments_is_not_a_read(repo: Repo) -> None:
+    # Kills: every `_value(...)` call counted as a limit read (an ordinary helper's name).
+    use = "def show(part):\n    return _value(part) or ''\n"
+    assert reading(repo, {"pkg/use.py": use}) == []
+
+
+def test_a_read_at_module_level_class_level_or_in_a_default_argument_is_said(repo: Repo) -> None:
+    # Kills: a read frozen at the default, because no answer from Q Branch exists at import.
+    use = ("from pkg.limits_here import CAP\n\nSIZE = limits.value(CAP.name)\n\n\n"
+           "class C:\n    HELD = limits.value('cap_a')\n\n\n"
+           "def f(n=limits.value('cap_a')):\n    return n\n\n\n"
+           "def ok(limits):\n    return limits.value('cap_a')\n")
+    found = reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use})
+    assert [m.split(" a read of")[0] for m in found] == [
+        "pkg/use.py:3:", "pkg/use.py:7:", "pkg/use.py:10:"]
+    assert "the limit `cap_a`" in found[0] and "run once before Q Branch has answered" in found[0]
+
+
+def test_a_lambda_at_module_level_is_a_deferred_read(repo: Repo) -> None:
+    # Kills: a module-level lambda body counted as an import-time read.
+    use = "READ = lambda limits: limits.value('cap_a')\n"
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use}) == []
+
+
+def test_the_declarations_own_figures_are_not_read_outside_the_library(repo: Repo) -> None:
+    # Kills: `.defaults[...]` used as the value in force, which no row of Q Branch can change.
+    use = ("def use(limits):\n    limits.value('cap_a')\n    return CAP.defaults['-'], "
+           "CAP.minima['-'], CAP.maxima['-']\n")
+    found = reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use})
+    assert [m.split(": ")[0] for m in found] == ["pkg/use.py:3"] * 3
+    assert sorted(m.split("`")[1] for m in found) == [".defaults[...]", ".maxima[...]",
+                                                       ".minima[...]"]
+    assert all("outside `limits.py`" in m for m in found)
+    # the library itself may read them, and so may a file the repository names
+    assert reading(repo, {"pkg/use.py": "", "pkg/limits.py": use}) == []
+    assert reading(repo, {"pkg/limits.py": "", "pkg/use.py": use},
+                   table_readers=("pkg/use.py",)) == []
+
+
+def test_a_live_limit_read_in_init_is_said_and_a_restart_one_read_with_at_start_is_not(
+        repo: Repo) -> None:
+    # Kills: the page saying nothing about a restart that is in fact needed.
+    live = ("class B:\n    def __init__(self, limits):\n"
+            "        self.cap = limits.value('cap_a')\n")
+    [message] = reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": live})
+    assert message.startswith("pkg/use.py:3: `cap_a` is read in an `__init__` but is `live`")
+    [by_constant] = reading(repo, {"pkg/use.py": live.replace("'cap_a'", "CAP.name")})
+    assert "`cap_a` is read in an `__init__`" in by_constant
+    restart = DECLARED.replace("{'-': 9})", "{'-': 9}, applies='restart')")
+    started = live.replace("limits.value", "limits.at_start")
+    assert reading(repo, {"pkg/limits_here.py": restart, "pkg/use.py": started}) == []
+    # a restart limit read with `value` in `__init__` is not the live case
+    assert reading(repo, {"pkg/limits_here.py": restart, "pkg/use.py": live}) == []
+
+
+@pytest.mark.parametrize("body", [
+    "x = limits.value('cap_a')\n    return x or 5",
+    "x = limits.value('cap_a')\n    return 5 if not x else x",
+    "x = limits.value('cap_a')\n    if x:\n        return 1\n    return 0",
+    "return limits.value('cap_a') or 5",
+    "return 7 if limits.value('cap_a') else 5",
+    "self.n = limits.value('cap_a')\n    return self.n or 5",
+])
+def test_a_read_used_as_a_truth_value_is_said(repo: Repo, body: str) -> None:
+    # Kills: a limit of 0 read as no limit, which is the brake turned into its opposite.
+    use = f"def use(limits, self=None):\n    {body}\n"
+    [message] = reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use})
+    assert message.startswith("pkg/use.py:") and "used as a condition" in message
+
+
+@pytest.mark.parametrize("body", [
+    "x = limits.value('cap_a')\n    return x > 0",
+    "x = limits.value('cap_a')\n    return x is not None and x < 9",
+    "x = limits.value('cap_a')\n    return 5 if x == 0 else x",
+    "return limits.value('cap_a') + 1",
+])
+def test_a_read_that_is_compared_is_not_a_truth_value(repo: Repo, body: str) -> None:
+    use = f"def use(limits):\n    {body}\n"
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use}) == []
+
+
+def test_a_truth_test_of_something_that_is_not_a_read_is_left_alone(repo: Repo) -> None:
+    # Kills: any `or` in a function that also reads a limit.
+    use = ("def use(limits, other):\n    n = limits.value('cap_a')\n    m = other or 5\n"
+           "    return n + m\n")
+    assert reading(repo, {"pkg/limits_here.py": DECLARED, "pkg/use.py": use}) == []
+
+
+def test_helper_names_beside_limit_declare_a_limit_only_when_configured(repo: Repo) -> None:
+    # Kills: a helper's first string argument read as a limit's name when the repository never
+    # said so, and one the repository did say so that is not found.
+    helper = "CAP = _cap('cap_h', 'A cap', 'count', 'day', 5, 9)\n"
+    assert reading(repo, {"pkg/helpers.py": helper}) == []
+    [message] = reading(repo, {"pkg/helpers.py": helper}, declarers=("_cap",))
+    assert "`cap_h` is declared and never read" in message
+
+
+def test_a_limit_known_unread_is_held_back_and_must_be_dropped_once_read(repo: Repo) -> None:
+    # Kills: an escape that stays for ever after the read arrives, or names a limit that is gone.
+    assert reading(repo, {"pkg/limits_here.py": DECLARED}, unread=("cap_a",)) == []
+    read = "def use(limits):\n    return limits.value('cap_a')\n"
+    [message] = reading(repo, {"pkg/use.py": read}, unread=("cap_a",))
+    assert "`cap_a` is now read; delete it from Config.unread" in message
+    [gone] = reading(repo, {}, unread=("cap_z",))
+    assert "Config.unread names `cap_z`, which no `Limit` declares" in gone
+
+
+def test_tests_and_skipped_paths_are_not_read_by_the_read_check(repo: Repo) -> None:
+    # Kills: a read in a test counting as the shipped code reading the limit.
+    read = "def t(limits):\n    return limits.value('cap_a')\n"
+    [message] = reading(repo, {"pkg/limits_here.py": DECLARED, "tests/test_x.py": read})
+    assert "`cap_a` is declared and never read" in message
 
 
 if __name__ == "__main__":
