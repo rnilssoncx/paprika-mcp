@@ -1,0 +1,21 @@
+src/paprika_mcp/credentials.py | <module> | WATCH_EVERY = | 60.0
+src/paprika_mcp/credentials.py | <module> | RETEST_AFTER = | 3600.0
+src/paprika_mcp/credentials.py | <module> | PROBE_TIMEOUT = | 10.0
+src/paprika_mcp/export.py | <module> | MEALS_BACK = | 30
+src/paprika_mcp/export.py | <module> | MEALS_AHEAD = | 90
+src/paprika_mcp/http.py | <module> | SPOKE_STEP = | 5.0
+src/paprika_mcp/tools/categories.py | <module> | TITLES_SHOWN = | 5
+src/paprika_mcp/tools/create_recipe.py | <module> | TOOL_DEFINITION = | {'name':'create_recipe','description':"CreateanewrecipeinPaprikafromfieldsyoufil...#1b59e030215a
+src/paprika_mcp/tools/format_fraction.py | format_fraction | len() compared with | 2
+src/paprika_mcp/tools/meal_plan.py | <module> | MAX_DAYS = | 62
+src/paprika_mcp/tools/meal_plan.py | list_meals_tool | days = | int(args.get('days',7))
+src/paprika_mcp/tools/search_recipes.py | search_recipes_tool | context_lines = | args.get('context_lines',2)
+src/paprika_mcp/tools/search_recipes.py | search_recipes_tool | page_size = | args.get('page_size',20)
+src/paprika_mcp/tools/search_recipes.py | <module> | TOOL_DEFINITION = | {'name':'search_recipes','description':"Searchrecipesbytextacrosstitle,ingredien...#cade6126ef1a
+src/paprika_mcp/tools/update_recipe.py | <module> | FIELD_LIMIT = | 64000
+src/paprika_mcp/utils.py | <module> | MAX_PATTERN_LENGTH = | 200
+src/paprika_mcp/utils.py | <module> | MATCH_SECONDS = | 2.0
+src/paprika_mcp/utils.py | <module> | MAX_QUERY_LENGTH = | 1000
+src/paprika_mcp/utils.py | get_remote | Remote(timeout=) | 30
+src/paprika_mcp/utils.py | search_in_text | default context_lines= | 2
+src/paprika_mcp/server.py | and three retries with

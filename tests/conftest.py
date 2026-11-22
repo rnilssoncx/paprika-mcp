@@ -40,3 +40,15 @@ def _own_vault(monkeypatch, tmp_path):
     monkeypatch.setattr(credentials, "_current", None)
     yield
     credentials._current = None
+
+
+
+def pytest_terminal_summary(terminalreporter) -> None:
+    """Every run ends with how many limits are not yet converted (068 § The guard)."""
+    from pathlib import Path
+
+    try:
+        import limitguard
+    except ModuleNotFoundError:  # `tests/` is a package here
+        from tests import limitguard
+    terminalreporter.write_line(limitguard.summary_line(Path(__file__).resolve().parent))
