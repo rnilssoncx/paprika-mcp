@@ -51,6 +51,7 @@ import copy
 import fnmatch
 import functools
 import hashlib
+import importlib
 import io
 import posixpath
 import re
@@ -59,7 +60,7 @@ import subprocess
 import sys
 import tokenize
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -155,7 +156,20 @@ class Config:
     `minima` or `maxima` (Q Branch's page, which draws them, and a provider that stands in for Q
     Branch where there is none); each is named in the repository's own block with its reason.
     `unread`: names of limits declared and known not to be read yet (another change is mid-way);
-    the read check holds a name here only while nothing reads it, so the list can only shrink."""
+    the read check holds a name here only while nothing reads it, so the list can only shrink.
+    `declared_from`: where the repository imports the limits its server posts from, each
+    `"package.module:attribute"` (a limit, a collection of them, or a function returning them):
+    the read check holds the scan against it, so a scanned name the server does not post is a
+    ghost and a posted name nothing reads is unread. A repository that declares nothing leaves it
+    empty, and then a `Limit` found in its source is a finding.
+    `read_helpers`: functions besides `value`, `at_start` and `value_in_force` that read the limit
+    they are given (Quartermaster's `count`, `dollars` and `day_cap`, calendar's `_budget`, its
+    provider `_provider`): a call to one that names a limit is a read of it, held to the same
+    rules; each must be called somewhere, so a helper that is renamed away is said.
+    `generic_reads`: `(table, reader)` pairs for limits read through one generic reader, as
+    `("package.module:TABLE", "path/to/file.py:Class.method")`: the test checks the reader exists,
+    its module names the table, and it asks for a value; then each limit of the table counts as
+    read."""
 
     root: Path
     guard_dir: Path
@@ -166,6 +180,9 @@ class Config:
     declarers: tuple[str, ...] = ()
     table_readers: tuple[str, ...] = ()
     unread: tuple[str, ...] = ()
+    declared_from: tuple[str, ...] = ()
+    generic_reads: tuple[tuple[str, str], ...] = ()
+    read_helpers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -834,6 +851,22 @@ def check_tags(cfg: Config) -> list[str]:
 # `check_new` sees only that a literal left, and every test passes at the default (a limit's default
 # equals today's value), so a converted value that is declared and never read, or read once at
 # import, passes everything. This check reads the code for the ways a conversion goes wrong.
+#
+# **What counts as a read** (the code review of step 0 found a heuristic that approved a limit
+# merely mentioned): a limit is read when its name, as a string literal, or its constant (`X`, or
+# `X.name`) is an *argument of a read call* (`value`, `at_start`, `value_in_force`, and `_value`
+# where an argument names a limit). A constant bound to another name first (`declared =
+# limiting.MARKED_DONE` in a class, `self._cap = limiting.HOLDS_LISTED`) is read through that name,
+# within the class that binds it. A constant that is only listed, passed to some other call, or
+# had its `.words` or `.defaults` read is not read. **A function that reads the limit it is
+# given** (`count(LIMIT)`) is named in `Config.read_helpers`, and a call to it is then a read call.
+# **A limit read by one reader that walks a table of them** is named in `Config.generic_reads` as a
+# `(table, reader)` pair, and then counts as read.
+#
+# **Against what the server really declares**: `Config.declared_from` names where the repository
+# imports its posted declarations from. A name the scan found that is not among them is a ghost (a
+# helper's unit or scope taken for a name), and a declared name that is not read is unread: absence
+# of a finding then means every posted limit is read.
 
 #: A call that asks for a limit's value. `value`, `at_start` and `value_in_force` always do;
 #: `_value` is also the name of ordinary helpers, so it counts only when an argument names a limit.
@@ -841,9 +874,12 @@ READ_CALLS = frozenset({"value", "_value", "at_start", "value_in_force"})
 SURE_READS = frozenset({"value", "at_start", "value_in_force"})
 DECLARING = frozenset({"Limit", "_limit"})  # a call whose first string argument names a limit
 LIMIT_TABLES = frozenset({"defaults", "minima", "maxima"})  # a declaration's own figures
-LIMITS_MODULE = "limits.py"  # the library file whose clamp may read them
+LIMITS_MODULE = "control/limits.py"  # the library file (from the root) whose clamp may read them
 NAME_PATTERN = re.compile(r"[a-z0-9_]{1,40}")
 OWN_NAME = "name"
+#: Calls that hand their argument back as a number: `int(limits.value(x))` is still the value.
+PASS_THROUGH = frozenset({"int", "float", "abs", "round"})
+ALIAS_DEPTH = 6
 
 
 @dataclass(frozen=True)
@@ -864,8 +900,9 @@ class Read:
     col: int
     callee: str
     names: frozenset[str]  # string literals among its arguments
-    idents: frozenset[str]  # constants among its arguments, `X` of `X.name` included
-    generic: bool  # an argument that is `<something>.name` whose something is not a constant
+    symbols: frozenset[str]  # `X` or `limiting.X` passed as it is, the last name of the chain
+    owners: frozenset[str]  # `X` of each `X.name` argument ("" where X is no plain name)
+    scope: str  # the class the call sits in, "" at module level
     in_init: bool
     at_import: bool  # module or class level, or a default argument: run once, before any answer
 
@@ -880,13 +917,17 @@ class ReadFacts:
     reads: list[Read] = field(default_factory=list)
     tables: list[tuple[int, str]] = field(default_factory=list)  # `.defaults[` and the like
     truthy: list[tuple[int, str, tuple[int, int]]] = field(default_factory=list)
-    refs: Counter[str] = field(default_factory=Counter)  # identifier -> uses outside a listing
+    callees: set[str] = field(default_factory=set)  # every function name this module calls
+    # (class scope, bound name) -> the names it is bound to: `declared = limiting.DRAFTS`
+    aliases: dict[tuple[str, str], set[str]] = field(default_factory=dict)
 
 
 def first_string(call: ast.Call) -> str | None:
-    for arg in call.args:
-        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-            return arg.value if NAME_PATTERN.fullmatch(arg.value) else None
+    """The limit's name: the **first positional argument**, and only when it is a literal. A
+    helper's own body (`Limit(name, words, unit, "household", ...)`) passes a variable first, and
+    its later string arguments are a unit and a scope, never a name."""
+    if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+        return call.args[0].value if NAME_PATTERN.fullmatch(call.args[0].value) else None
     return None
 
 
@@ -897,9 +938,12 @@ def applies_of(call: ast.Call) -> str:
     return "live"
 
 
-def read_key(node: ast.AST) -> tuple[int, int] | None:
-    if isinstance(node, ast.Call) and callname(node) in READ_CALLS:
-        return (node.lineno, node.col_offset)
+def read_key(node: ast.AST, calls: frozenset[str] = READ_CALLS) -> tuple[int, int] | None:
+    if isinstance(node, ast.Call):
+        if callname(node) in PASS_THROUGH and len(node.args) == 1 and not node.keywords:
+            return read_key(node.args[0], calls)
+        if callname(node) in calls:
+            return (node.lineno, node.col_offset)
     return None
 
 
@@ -912,17 +956,43 @@ def walk_scope(node: ast.AST) -> list[ast.AST]:
     return out
 
 
+def read_arguments(node: ast.AST, names: set[str], symbols: set[str], owners: set[str]) -> None:
+    """What one argument of a read call names: a string literal, a constant passed as it is, or
+    `<something>.name`. A call inside an argument is somebody else's argument, and `X.words` or
+    `X.defaults` is not `X`."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            names.add(node.value)
+    elif isinstance(node, ast.Name):
+        symbols.add(node.id)
+    elif isinstance(node, ast.Attribute):
+        if node.attr == OWN_NAME:
+            owners.add(opname(node.value))
+        else:
+            symbols.add(node.attr)
+    elif not isinstance(node, ast.Call):
+        for child in ast.iter_child_nodes(node):
+            read_arguments(child, names, symbols, owners)
+
+
 class ReadScan(ast.NodeVisitor):
     """Walks one module and records what the read check asks of it."""
 
-    def __init__(self, path: str, declarers: frozenset[str]) -> None:
+    def __init__(self, path: str, declarers: frozenset[str], helpers: frozenset[str]) -> None:
         self.path, self.declarers = path, declarers
+        self.read_calls = READ_CALLS | helpers
         self.facts = ReadFacts(path)
         self.functions: list[str] = []  # enclosing function names, innermost last
+        self.classes: list[str] = []  # enclosing class names, innermost last
         self.deferred = 0  # inside a function or lambda body: runs when called, not at import
         self.target = ""  # the constant the statement being walked assigns to
 
     # scopes ---------------------------------------------------------------------------
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.classes.append(node.name)
+        self.generic_visit(node)
+        self.classes.pop()
+
     def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for default in [*node.args.defaults, *[d for d in node.args.kw_defaults if d]]:
             self.visit(default)  # a default runs where the function is defined
@@ -949,106 +1019,92 @@ class ReadScan(ast.NodeVisitor):
         self.generic_visit(node)
         self.truthiness(node.body)
 
-    # declarations ---------------------------------------------------------------------
+    # declarations and bindings ----------------------------------------------------------
+    def bind(self, targets: list[ast.expr], value: ast.expr | None) -> None:
+        """`declared = limiting.MARKED_DONE` or `self._cap = limiting.HOLDS_LISTED`: the target is
+        another name for the constant, within this class."""
+        if isinstance(value, (ast.Name, ast.Attribute)):
+            for target in targets:
+                if isinstance(target, (ast.Name, ast.Attribute)) and opname(target):
+                    scope = self.classes[-1] if self.classes else ""
+                    self.facts.aliases.setdefault((scope, opname(target)), set()).add(
+                        opname(value))
+
     def visit_Assign(self, node: ast.Assign) -> None:
         names = [t.id for t in node.targets if isinstance(t, ast.Name)]
         previous, self.target = self.target, names[0] if len(names) == 1 else ""
+        self.bind(node.targets, node.value)
         self.generic_visit(node)
         self.target = previous
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         previous = self.target
         self.target = node.target.id if isinstance(node.target, ast.Name) else ""
+        self.bind([node.target], node.value)
         self.generic_visit(node)
         self.target = previous
-
-    # references and reads -------------------------------------------------------------
-    def listing(self, node: ast.Tuple | ast.List | ast.Set) -> None:
-        """A constant that is a direct element of a collection is listed, not used."""
-        for element in node.elts:
-            if isinstance(element, (ast.Name, ast.Attribute)):
-                continue
-            self.visit(element)
-
-    visit_Tuple = visit_List = visit_Set = listing
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.facts.refs[node.id] += 1
-
-    def visit_Attribute(self, node: ast.Attribute) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.facts.refs[node.attr] += 1
-        self.generic_visit(node)
-
-    def visit_Starred(self, node: ast.Starred) -> None:
-        if not isinstance(node.value, (ast.Name, ast.Attribute)):
-            self.visit(node.value)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         v = node.value
         if (isinstance(v, ast.Attribute) and v.attr in LIMIT_TABLES
-                and posixpath.basename(self.path) != LIMITS_MODULE):
+                and self.path != LIMITS_MODULE):
             self.facts.tables.append((node.lineno, v.attr))
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         name = callname(node)
+        self.facts.callees.add(name)
         if name in DECLARING or name in self.declarers:
             limit = first_string(node)
             if limit is not None:
                 self.facts.declared.append(Declared(
                     self.path, node.lineno, limit, self.target, applies_of(node)))
             self.target = ""  # a constant is the limit only when the call is the whole value
-        if name in READ_CALLS:
+        f = node.func
+        if (name == "get" and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Attribute)
+                and f.value.attr in LIMIT_TABLES and self.path != LIMITS_MODULE):
+            self.facts.tables.append((node.lineno, f.value.attr))  # `.defaults.get(...)` too
+        if name in self.read_calls:
             self.record_read(node, name)
         self.generic_visit(node)
 
     def record_read(self, node: ast.Call, name: str) -> None:
         names: set[str] = set()
-        idents: set[str] = set()
-        generic = False
+        symbols: set[str] = set()
+        owners: set[str] = set()
         for arg in [*node.args, *[kw.value for kw in node.keywords]]:
-            for inner in ast.walk(arg):
-                if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
-                    names.add(inner.value)
-                elif isinstance(inner, ast.Attribute) and inner.attr == OWN_NAME:
-                    owner = opname(inner.value)
-                    if owner.isupper():
-                        idents.add(owner)
-                    else:
-                        generic = True
-                elif isinstance(inner, (ast.Name, ast.Attribute)) and opname(inner).isupper():
-                    idents.add(opname(inner))
+            read_arguments(arg, names, symbols, owners)
         self.facts.reads.append(Read(
-            self.path, node.lineno, node.col_offset, name, frozenset(names), frozenset(idents),
-            generic, bool(self.functions) and self.functions[-1] == "__init__",
-            not self.deferred))
+            self.path, node.lineno, node.col_offset, name, frozenset(names), frozenset(symbols),
+            frozenset(owners), self.classes[-1] if self.classes else "",
+            bool(self.functions) and self.functions[-1] == "__init__", not self.deferred))
 
     # a read used as a condition ---------------------------------------------------------
     def truthiness(self, body: list[ast.stmt]) -> None:
         """A limit's value used as a truth value turns a 0 into *no limit*. Within one function
-        (or the module's own statements), a name assigned from a read and then used as an `or` or
-        `and` operand, under `not`, or as an `if`, `while`, conditional-expression or `assert`
-        test, and a read used so directly."""
+        (or the module's own statements), a name assigned from a read (also through `int(...)`,
+        `:=`, or one element of a tuple assignment) and then used as an `or` or `and` operand,
+        under `not`, as an `if`, `while`, conditional-expression, comprehension-filter or
+        `assert` test, and a read used so directly. A name set in one method and tested in
+        another is not followed."""
         nodes = [n for statement in body
                  if not isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
                  for n in walk_scope(statement)]
         tainted: dict[str, tuple[int, int]] = {}
         for n in nodes:
-            targets: list[ast.AST] = []
+            pairs: list[tuple[str, ast.AST]] = []
             if isinstance(n, ast.Assign):
-                targets, value = list(n.targets), n.value
-            elif isinstance(n, ast.AnnAssign) and n.value is not None:
-                targets, value = [n.target], n.value
-            else:
-                continue
-            key = read_key(value)
-            if key is not None:
-                tainted.update({opname(t): key for t in targets if opname(t)})
+                for target in n.targets:
+                    pairs += pair_targets(target, n.value)
+            elif isinstance(n, (ast.AnnAssign, ast.NamedExpr)) and n.value is not None:
+                pairs = pair_targets(n.target, n.value)
+            for target_name, value in pairs:
+                key = read_key(value, self.read_calls)
+                if key is not None and target_name:
+                    tainted[target_name] = key
 
         def source(x: ast.AST) -> tuple[int, int] | None:
-            key = read_key(x)
+            key = read_key(x, self.read_calls)
             if key is not None:
                 return key
             if isinstance(x, (ast.Name, ast.Attribute)):
@@ -1063,44 +1119,114 @@ class ReadScan(ast.NodeVisitor):
                 tested = [n.operand]
             elif isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)):
                 tested = [n.test]
+            elif isinstance(n, ast.comprehension):
+                tested = list(n.ifs)
             for x in tested:
-                key = source(x)
+                probe = x.target if isinstance(x, ast.NamedExpr) else x
+                key = source(probe)
                 if key is not None:
-                    self.facts.truthy.append((getattr(x, "lineno", 0), opname(x) or callname(x),
-                                              key))
+                    self.facts.truthy.append((getattr(probe, "lineno", 0),
+                                              opname(probe) or callname(probe), key))
 
 
 @functools.cache
-def read_facts(rel: str, source: str, declarers: frozenset[str]) -> ReadFacts | None:
+def read_facts(rel: str, source: str, declarers: frozenset[str],
+               helpers: frozenset[str] = frozenset()) -> ReadFacts | None:
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None  # `check_new` already reports a file that does not parse
-    scan = ReadScan(rel, declarers)
+    scan = ReadScan(rel, declarers, helpers)
     scan.visit(tree)
     return scan.facts
 
 
-def read_problems(cfg: Config) -> list[str]:
-    """Every way a declared limit is not read, or is read wrongly. Each names the file, the line
-    and the limit. An empty list is a pass.
+def resolve(spec: str) -> dict[str, str]:
+    """The limits a `module:attribute` names, as `{name: applies}`. The attribute is a limit, an
+    iterable or dict of them, or a function returning either; a string in a collection is a name.
+    **The real thing, imported**: this is what the server posts, so the check is against what is
+    declared, not against what the scan believes is."""
+    module, _, attr = spec.partition(":")
+    found: dict[str, str] = {}
 
-    - **a declared limit with no read.** Its name is a string argument of a read call (`value`,
-      `at_start`, `value_in_force`, and `_value` where an argument names a limit), or its constant
-      is (as `X` or `X.name`). Where a repository reads through one helper that takes the limit
-      (`Budget(LIMIT)` and `value(limit.name)` inside it), the limit counts as read when such a
-      generic read exists and the constant is used (passed, indexed, returned) anywhere but as an
-      element of a listing: a constant that appears only in its declaration and a tuple is
-      declared and never read;
+    def take(item: Any) -> None:
+        name = getattr(item, "name", None)
+        if isinstance(item, str):
+            found[item] = "live"
+        elif isinstance(name, str) and not isinstance(item, (dict, list, tuple, set, frozenset)):
+            found[name] = str(getattr(item, "applies", "live"))
+        elif isinstance(item, dict):
+            for value in item.values():
+                take(value)
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            for value in item:
+                take(value)
+        elif callable(item):
+            take(item())
+        else:
+            raise TypeError(f"{spec} is not a limit, a collection of them or a function")
+
+    take(getattr(importlib.import_module(module), attr))
+    return found
+
+
+def reader_problem(cfg: Config, table: str, reader: str) -> str | None:
+    """Why a `(table, reader)` pair of `Config.generic_reads` does not hold, or None: the reader
+    exists in its file (`path.py:function` or `path.py:Class.method`), its module names the table
+    (hands it over or walks it), and it asks for a value."""
+    path, _, qualified = reader.partition(":")
+    attr = table.rpartition(":")[2].rpartition(".")[2]
+    where = f"Config.generic_reads `({table}, {reader})`"
+    try:
+        tree = ast.parse((cfg.root / path).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return f"{where}: `{path}` cannot be read as Python"
+    scope: ast.AST = tree
+    *outer, last = qualified.split(".")
+    for part in outer:
+        scope = next((n for n in ast.walk(scope) if isinstance(n, ast.ClassDef)
+                      and n.name == part), ast.Module(body=[], type_ignores=[]))
+    function = next((n for n in ast.walk(scope) if isinstance(
+        n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == last), None)
+    if function is None:
+        return f"{where}: no function `{qualified}` in `{path}`"
+    loaded = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    if attr not in loaded:
+        return f"{where}: `{path}` never names `{attr}`, so the reader does not walk that table"
+    reading = READ_CALLS | set(cfg.read_helpers)
+    asks = any(isinstance(n, ast.Call) and (callname(n) in reading or any(
+        isinstance(a, ast.Attribute) and a.attr == OWN_NAME for a in n.args))
+        for n in ast.walk(function))
+    if not asks:
+        return (f"{where}: `{qualified}` asks for no value (no `value`, `at_start` or "
+                "`value_in_force` call, and no call with a `<limit>.name` argument)")
+    return None
+
+
+def read_problems(cfg: Config, resolver: Callable[[str], dict[str, str]] | None = None
+                  ) -> list[str]:
+    """Every way a declared limit is not read, or is read wrongly. Each names the file, the line
+    and the limit. An empty list is a pass. `resolver` turns a `module:attribute` into the limits
+    it names (`resolve`, the real import, in every repository's own test); left out, the set the
+    scan found stands in for the declared set and `Config.generic_reads` is not checked.
+
+    - **a declared limit with no read**: see the notes above for what counts;
+    - **a name the scan found that the server does not declare** (`Config.declared_from`): a
+      helper's unit or scope taken for a limit's name;
     - **a read at import**: at module or class level, or in a default argument, where no answer
       from Q Branch exists yet, so the value is the default for ever;
-    - **`.defaults[`, `.minima[` or `.maxima[` outside `limits.py`** (and the paths in
-      `Config.table_readers`): a figure from the declaration where the value in force belongs;
-    - **a read in an `__init__` for a limit declared `live`**: the page then says nothing about a
-      restart that is in fact needed (`restart` limits are read with `at_start`);
+    - **`.defaults[`, `.minima[` or `.maxima[`** (and `.get(`) **outside `limits.py`** (and the
+      paths in `Config.table_readers`): a figure from the declaration where the value in force
+      belongs;
+    - **a read that does not match `applies`**: a `restart` limit read with anything but
+      `at_start` (the page then says a change was picked up that the running server did not
+      build with), a `live` one read with `at_start` (frozen until a restart), and a `live` one
+      read in an `__init__` (read once, and a change needs a restart the page does not say);
     - **a read used as a truth value** (`x or ...`, `if not x`): a 0 would mean *no limit*.
     """
     declarers = frozenset(cfg.declarers)
+    helpers = frozenset(cfg.read_helpers)
     facts: list[ReadFacts] = []
     for rel in listed(cfg.root):
         p = cfg.root / rel
@@ -1113,48 +1239,124 @@ def read_problems(cfg: Config) -> list[str]:
             source = p.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        found = read_facts(rel, source, declarers)
+        found = read_facts(rel, source, declarers, helpers)
         if found is not None:
             facts.append(found)
-    declared = [d for f in facts for d in f.declared]
-    by_name = {d.name: d for d in declared}
-    idents = {d.ident for d in declared if d.ident}
-    # A call counts as a read when it is one of the sure ones or an argument names a limit.
-    reads = {(*r.key(), r.path): r for f in facts for r in f.reads
-             if r.callee in SURE_READS or r.generic or (r.names & by_name.keys())
-             or (r.idents & idents)}
-    refs: Counter[str] = Counter()
-    for f in facts:
-        refs.update(f.refs)
-    generic_read = any(r.generic for r in reads.values())
+    by_path = {f.path: f for f in facts}
+    called = {c for f in facts for c in f.callees}
     out: list[str] = []
-    for d in declared:
-        literal = any(d.name in r.names for r in reads.values())
-        owned = bool(d.ident) and any(d.ident in r.idents for r in reads.values())
-        # A constant's own declaration is a store, never a load, so any load is a use.
-        wired = generic_read and (refs[d.ident] > 0 if d.ident else True)
-        if d.name in cfg.unread:
-            if literal or owned or wired:
+    for helper in cfg.read_helpers:
+        if helper not in called:
+            out.append(f"Config.read_helpers names `{helper}`, which nothing calls: delete it")
+    scanned = [d for f in facts for d in f.declared]
+    scan_applies = {d.name: d.applies for d in scanned}
+
+    # What the server declares: imported, or (no resolver) what the scan found.
+    posted: dict[str, str]
+    if resolver is None:
+        posted = dict(scan_applies)
+    else:
+        posted = {}
+        for spec in cfg.declared_from:
+            posted.update(resolver(spec))
+        for d in scanned:
+            if d.name not in posted:
+                out.append(f"{d.path}:{d.line}: `{d.name}` is declared here but is not among the "
+                           "limits the server posts (Config.declared_from): a unit or a scope "
+                           "taken for a name, or a limit left out of the post")
+    applies_of_name = {**scan_applies, **posted}
+
+    # Limits read by a generic reader, as the repository's own table says.
+    through_readers: set[str] = set()
+    for table, reader in cfg.generic_reads:
+        if resolver is None:
+            continue
+        problem = reader_problem(cfg, table, reader)
+        if problem is not None:
+            out.append(problem)
+        else:
+            through_readers |= set(resolver(table))
+
+    idents = {d.ident for d in scanned if d.ident}
+
+    def idents_of(symbol: str, path: str, scope: str, seen: frozenset[str]) -> set[str]:
+        if symbol in idents:
+            return {symbol}
+        found: set[str] = set()
+        if symbol in seen or len(seen) > ALIAS_DEPTH or path not in by_path:
+            return found
+        for place in (scope, ""):
+            for source in by_path[path].aliases.get((place, symbol), ()):
+                found |= idents_of(source, path, scope, seen | {symbol})
+        return found
+
+    ident_name = {d.ident: d.name for d in scanned if d.ident}
+    read_names: set[str] = set()  # by a literal
+    read_idents: set[str] = set()  # by a constant, directly or through a name it is bound to
+    reads: dict[tuple[int, int, str], Read] = {}
+    named: dict[tuple[int, int, str], set[str]] = {}  # the limits a read call names
+    generic_keys: set[tuple[int, int, str]] = set()
+    for f in facts:
+        for r in f.reads:
+            key = (*r.key(), r.path)
+            hit = {i for sym in (*r.symbols, *r.owners)
+                   for i in idents_of(sym, r.path, r.scope, frozenset())}
+            literal = {n for n in r.names if n in posted or n in scan_applies}
+            if r.owners and any(not idents_of(o, r.path, r.scope, frozenset()) for o in r.owners):
+                generic_keys.add(key)
+            if r.callee in SURE_READS or hit or literal:
+                reads[key] = r
+                named[key] = literal | {ident_name[i] for i in hit}
+                read_idents |= hit
+                read_names |= literal
+
+    unread_set = set(cfg.unread)
+    for d in scanned:
+        done = d.name in read_names or d.ident in read_idents or d.name in through_readers
+        if d.name in unread_set:
+            if done:
                 out.append(f"{d.path}:{d.line}: the limit `{d.name}` is now read; delete it from "
                            "Config.unread")
-        elif not (literal or owned or wired):
+        elif not done:
             out.append(f"{d.path}:{d.line}: the limit `{d.name}` is declared and never read: no "
-                       "read call names it, and no read takes it through a helper")
+                       "read call names it (its name, its constant, or a name bound to it), and "
+                       "Config.generic_reads does not cover it")
+    scanned_names = {d.name for d in scanned}
+    for name in sorted(posted):
+        if name in scanned_names:
+            continue  # checked above, with its file and line
+        done = name in read_names or name in through_readers
+        if name in unread_set:
+            if done:
+                out.append(f"the limit `{name}` is now read; delete it from Config.unread")
+        elif not done:
+            out.append(f"Config.declared_from: the limit `{name}` is posted but never read: no "
+                       "read call names it, and Config.generic_reads does not cover it")
     for name in cfg.unread:
-        if name not in by_name:
+        if name not in posted:
             out.append(f"Config.unread names `{name}`, which no `Limit` declares: delete it")
-    for r in reads.values():
-        named = sorted({n for n in r.names if n in by_name}
-                       | {d.name for d in declared if d.ident and d.ident in r.idents})
+
+    for key, r in reads.items():
+        limits = sorted(named[key])
         if r.at_import:
-            which = f" the limit `{named[0]}`" if named else " a limit"
+            which = f" the limit `{limits[0]}`" if limits else " a limit"
             out.append(f"{r.path}:{r.line}: a read of{which} at module or class level or in a "
                        "default argument, run once before Q Branch has answered, so it is the "
                        "default for ever; read it where it is used")
+        for name in limits:
+            kind = applies_of_name.get(name, "live")
+            if kind == "restart" and r.callee != "at_start":
+                out.append(f"{r.path}:{r.line}: `{name}` is `restart` but is read with "
+                           f"`{r.callee}`: the page would say a change was picked up that the "
+                           "running server did not build with; read it with `at_start`")
+            elif kind == "live" and r.callee == "at_start":
+                out.append(f"{r.path}:{r.line}: `{name}` is `live` but is read with `at_start`, "
+                           "which holds the value it had at start until a restart; read it with "
+                           "`value` where it is used, or declare it `restart`")
         if r.in_init and r.callee != "at_start":
-            live = [by_name[n] for n in named if by_name[n].applies == "live"]
-            if live or r.generic:
-                which = live[0].name if live else "a limit"
+            live = [n for n in limits if applies_of_name.get(n, "live") == "live"]
+            if live or key in generic_keys:
+                which = live[0] if live else "a limit"
                 out.append(f"{r.path}:{r.line}: `{which}` is read in an `__init__` but is `live`: "
                            "it is then read once, and a change on the page needs a restart that "
                            "the page does not say; read it where it is used, or declare it "
@@ -1170,7 +1372,8 @@ def read_problems(cfg: Config) -> list[str]:
                 out.append(f"{f.path}:{line}: the value of a limit (`{what}`) used as a "
                            "condition: a limit of 0 would mean no limit; compare it (`> 0`, "
                            "`is None`)")
-    return sorted(out, key=lambda m: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", m)])
+    return sorted(set(out), key=lambda m: [int(t) if t.isdigit() else t
+                                           for t in re.split(r"(\d+)", m)])
 
 
 def summary_line(guard_dir: Path) -> str:
