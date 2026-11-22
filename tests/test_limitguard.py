@@ -67,7 +67,13 @@ FOUND = [
     ("def f(page_size=20): ...", ["20"]),
     ("def f(*, retries: int = 3): ...", ["3"]),
     ("x = args.get('page_size', 25)", ["25"]),
-    ("page_size = args.get('page_size', 25)", ["args.get('page_size',25)"]),
+    ("page_size = args.get('page_size', 25)", ['args.get("…",25)']),
+    ("c.post(u, json={'max_results': 100}, params={'limit': 50})", ["100", "50"]),
+    ("opts = {'net': {'timeout': 30}}", ["30"]),
+    ("opts = {'retry': {'timeout': 30}}", ['{"…":30}']),
+    ("def f():\n    return {'ttl': 3 * 60}", ["3*60"]),
+    ("token_ttl = issue('alice@home.example', 30)", ['issue("…",30)']),
+    ("x = {'page_size': g(f'{who} 20', b'raw', 20)}", ['g("…","…",20)']),
     ("if attempt < 3: pass", ["3"]),
     ("if self.depth >= 32: pass", ["32"]),
     ("if len(x) > 200: pass", ["200"]),
@@ -97,7 +103,23 @@ NOT_FOUND = [
     "MARKED = _limit('marked', 'Messages marked', 'member', 'hour', 10, 200)",
     "MARKED = Limit('n', 'w', 'count', 'member', 'hour', {'-': 10}, {'-': 200})",
     "x = f'{timeout}'",
+    "x = {'max_results': 1}",
+    "x = {'name': 30}",
+    "x = {'timeout': '30s'}",
+    "x = {'timeout': None, 'limit': n}",
 ]
+
+# every call in `lg.CALL_ARGS` and every position of it, written out so that deleting an entry or
+# an index from the detector fails here rather than being read back from the same table
+CALLS = {
+    "sleep": (0,), "wait_for": (1,), "timeout": (0,), "fail_after": (0,), "move_on_after": (0,),
+    "Semaphore": (0,), "BoundedSemaphore": (0,), "ThreadPoolExecutor": (0,),
+    "ProcessPoolExecutor": (0,), "islice": (1, 2), "timedelta": (0, 1, 2, 3, 4, 5, 6),
+    "Timeout": (0, 1, 2, 3), "setrlimit": (1,), "alarm": (0,), "settimeout": (0,),
+    "lru_cache": (0,), "deque": (1,), "Queue": (0,), "read": (0,), "read1": (0,), "recv": (0,),
+    "readline": (0,), "fetchmany": (0,), "join": (0,), "wait": (0,), "call_later": (0,),
+    "acquire": (0, 1), "result": (0,), "Timer": (0,), "communicate": (1,),
+}  # fmt: skip
 
 
 def values(source: str) -> list[str]:
@@ -116,11 +138,92 @@ def test_detector_leaves_alone(source: str) -> None:
     assert values(source) == []
 
 
+def test_every_call_and_position_is_read() -> None:
+    assert {k: tuple(v) for k, v in lg.CALL_ARGS.items()} == CALLS
+    for name, indexes in CALLS.items():
+        for index in indexes:
+            args = ", ".join("77" if i == index else "a" for i in range(index + 1))
+            assert values(f"x.{name}({args})") == ["77"], (name, index)
+            assert values(f"{name}({args})") == ["77"], (name, index)
+
+
+def test_a_non_limit_argument_of_those_calls_is_left_alone() -> None:
+    assert values("x.wait(timeout_s)\nx.acquire(True)\nx.result()\nx.communicate(data)") == []
+
+
 def test_a_file_that_does_not_parse_is_a_problem_not_a_skip() -> None:
     _, _, problems = lg.python_hits("m.py", "def (:\n")
     assert problems
     assert "does not parse" in problems[0]
     assert "not skipped" in problems[0]
+
+
+JS_SHAPES = [
+    ("const", "const MAX_BYTES = 90 * 1024;", ["90*1024;"]),
+    ("timer", "setTimeout(go, 3000);", ["3000"]),
+    ("timer", "setInterval(() => tick(), 500)", ["500"]),
+    ("prop", "x = { pollMs: 250, name: 9 };", ["250"]),
+    ("default", "function f(a, retryCount = 4) {}", ["4"]),
+    ("slice", "x.slice(0, 200);", ["200"]),
+    ("slice", "x.substring(0, 50);", ["50"]),
+    ("length", "if (xs.length > 50) {}", ["50"]),
+    ("lname", "let retries = 3;", ["3"]),
+    ("quoted", "const U_MAX = 'http://x/y' + 30;", ['"…"+30;']),
+]
+CONF_SHAPES = [
+    ("key", "mem_limit: 384m", ["384m"]),
+    ("key", "- RETRY_MAX=5", ["5"]),
+    ("opt", "tmpfs: /run:size=8m", ["8m"]),
+    ("opt", "tmpfs: /run:nr_inodes=100", ["100"]),
+    *[("cmd", f"run {cmd} 77 now", ["77"]) for cmd in (
+        "sleep", "timeout", "--max-time", "--connect-timeout", "--interval", "--start-period",
+        "--retries", "-m", "--retry", "limit rate", "burst")],
+]
+NOT_TEXT = [
+    (True, "const name = 'a1';\nx = { port: 8080 };\nx.slice(0, 5);\nlet other = 3;"),
+    (False, "mode=1777\nport: 8080\nsleeping 30\nretries: 1"),
+]
+
+
+@pytest.mark.parametrize(("kind", "source", "expected"), JS_SHAPES)
+def test_each_javascript_shape(kind: str, source: str, expected: list[str]) -> None:
+    hits, problems = lg.text_hits("a.js", source + "\n", js=True)
+    assert not problems
+    assert sorted(h.value for h in hits) == expected, kind
+    assert hits[0].what.startswith(kind.replace("quoted", "const")), hits[0].what
+
+
+@pytest.mark.parametrize(("kind", "source", "expected"), CONF_SHAPES)
+def test_each_configuration_shape(kind: str, source: str, expected: list[str]) -> None:
+    hits, problems = lg.text_hits("c.yml", source + "\n", js=False)
+    assert not problems
+    assert sorted(h.value for h in hits) == expected, kind
+    assert hits[0].what.startswith(kind), hits[0].what
+
+
+@pytest.mark.parametrize(("js", "source"), NOT_TEXT)
+def test_text_shapes_left_alone(js: bool, source: str) -> None:
+    hits, _ = lg.text_hits("a.js" if js else "c.yml", source + "\n", js=js)
+    assert hits == []
+
+
+def test_a_text_tag_covers_the_line_below_it_and_no_more() -> None:
+    js = f"// {REASON}\nconst A_MAX = 5;\nconst B_MAX = 6;\n"
+    hits, problems = lg.text_hits("a.js", js, js=True)
+    assert not problems
+    assert [(h.value, h.tag.kind if h.tag else None) for h in hits] == [
+        ("5;", "format"), ("6;", None)]
+    conf = f"# {REASON}\nmem_limit: 384m\nsleep 30\n"
+    hits, _ = lg.text_hits("c.yml", conf, js=False)
+    assert [(h.value, h.tag.kind if h.tag else None) for h in hits] == [
+        ("384m", "format"), ("30", None)]
+
+
+def test_a_text_tag_with_nothing_to_cover_or_malformed_is_a_problem() -> None:
+    _, problems = lg.text_hits("a.js", f"foo(); // {REASON}\n", js=True)
+    assert "no limit on its line" in problems[0]
+    _, problems = lg.text_hits("a.js", "const A_MAX = 5; // limit-ok: nonsense\n", js=True)
+    assert "does not read `limit-ok: <kind>" in problems[0]
 
 
 def test_text_detector_sees_the_javascript_and_configuration_shapes() -> None:
@@ -333,17 +436,58 @@ def test_reply_bound_counts_only_in_the_modules_that_read_q_branch(repo: Repo) -
 def test_not_a_limit_is_refused_on_a_strong_limit_word(repo: Repo) -> None:
     repo.write("pkg/b.py", "CONNECT_TIMEOUT = 5  # limit-ok: not-a-limit — it is only a label\n")
     found = repo.problems()
-    assert any("`not-a-limit` is refused on a name carrying `timeout`" in m for m in found["tags"])
+    assert any("`not-a-limit` is refused on a hit whose name or description carries `timeout`"
+               in m for m in found["tags"])
     assert any("CONNECT_TIMEOUT = 5" in m for m in found["new"])
 
 
-def test_a_list_or_tags_line_may_not_name_a_path_that_never_ships(repo: Repo) -> None:
-    repo.append("tests/limitguard-todo.txt", "deploy/keys/keys.py | <module> | A = | 5\n")
+def test_not_a_limit_is_refused_on_an_unnamed_call_hit_too(repo: Repo) -> None:
+    repo.write("pkg/b.py", "import asyncio\n\n\nasync def g(x):\n"
+               "    await asyncio.wait_for(x, 30)  # limit-ok: not-a-limit — an animation pause\n"
+               "    await asyncio.sleep(2)  # limit-ok: not-a-limit — an animation pause\n")
+    found = repo.problems()
+    refused = [m for m in found["tags"] if "`not-a-limit` is refused" in m]
+    assert len(refused) == 2
+    assert any("wait_for(arg 1) 30" in m and "carries `wait`" in m for m in refused)
+    assert any("sleep(arg 0) 2" in m and "carries `sleep`" in m for m in refused)
+    assert sum("new limit" in m for m in found["new"]) == 2
+
+
+def test_format_is_not_refused_on_a_strong_word_the_registry_is_the_control(repo: Repo) -> None:
+    repo.write("pkg/b.py", "CONNECT_TIMEOUT = 5  # limit-ok: format — the vendor fixes this\n")
+    repo.append("tests/limitguard-tags.txt", "pkg/b.py | <module> | CONNECT_TIMEOUT = | 5 | "
+                "format | the vendor fixes this\n")
+    assert repo.problems() == {"new": [], "list": [], "tags": []}
+
+
+def test_a_listed_path_that_never_ships_is_stale_and_an_anchor_may_not_name_one(
+    repo: Repo,
+) -> None:
+    repo.write("deploy/keys.py", "A_TIMEOUT = 5\n")
+    repo.append("tests/limitguard-todo.txt", "deploy/keys.py | <module> | A_TIMEOUT = | 5\n"
+                "plans/x.py | the anchor text\n")
     repo.append("tests/limitguard-tags.txt",
                 "plans/x.py | <module> | A = | 5 | format | long enough reason\n")
     found = repo.problems()
-    assert any("deploy/keys/keys.py" in m and "never ships" in m for m in found["list"])
-    assert any("plans/x.py" in m and "never ships" in m for m in found["tags"])
+    assert any("stale line" in m and "deploy/keys.py" in m for m in found["list"])
+    assert any("`plans/x.py | the anchor" in m and "never ships" in m for m in found["list"])
+    assert not any("never ships" in m for m in found["tags"])
+    assert any("line with no matching tag" in m and "plans/x.py" in m for m in found["tags"])
+
+
+def test_an_anchor_is_four_characters_and_has_no_separator_in_it(repo: Repo) -> None:
+    repo.write("pkg/c.py", "def go(attempt):\n    return attempt | 4\n")
+    repo.append("tests/limitguard-todo.txt", "pkg/c.py | att\npkg/c.py | a | b\n")
+    found = repo.problems()
+    assert sum("is neither `path | scope | what | value` nor `path | anchor`" in m
+               for m in found["list"]) == 2
+    assert not found["new"]
+
+
+def test_a_symlinked_python_file_is_read(repo: Repo) -> None:
+    (repo.root / "pkg/link.py").symlink_to(repo.root / "pkg/a.py")
+    found = " ".join(lg.check_new(repo.cfg))
+    assert "pkg/link.py:5 (<module>) LISTED = 30" in found
 
 
 def test_a_hand_found_anchor_must_stay_in_its_file(repo: Repo) -> None:
@@ -362,6 +506,33 @@ def test_the_skipped_paths_are_not_read(repo: Repo) -> None:
     assert repo.problems() == {"new": [], "list": [], "tags": []}
 
 
+def test_a_skipped_name_is_skipped_from_the_root_only_never_by_folder_name_anywhere(
+    repo: Repo,
+) -> None:
+    for rel in ("pkg/tests/x.py", "pkg/deploy/x.py", "pkg/spikes/x.py", "pkg/plans/x.py",
+                "pkg/evals/x.py", "pkg/vendor/x.py"):
+        repo.write(rel, "X_TIMEOUT = 5\n")
+    cfg = lg.Config(root=repo.root, guard_dir=repo.cfg.guard_dir, skip=("vendor/",))
+    found = " ".join(lg.check_new(cfg))
+    for rel in ("pkg/tests/x.py", "pkg/deploy/x.py", "pkg/spikes/x.py", "pkg/plans/x.py",
+                "pkg/evals/x.py", "pkg/vendor/x.py"):
+        assert rel + ":1" in found, rel
+
+
+def test_a_configured_skip_is_a_prefix_a_pattern_or_one_exact_file(repo: Repo) -> None:
+    for rel in ("vendor/v.py", "gen/a_pb.py", "gen/b.py", "walt/loki-test.py",
+                "walt/loki-test2.py"):
+        repo.write(rel, "X_TIMEOUT = 5\n")
+    cfg = lg.Config(root=repo.root, guard_dir=repo.cfg.guard_dir,
+                    skip=("vendor/", "gen/*_pb.py", "walt/loki-test.py"))
+    found = " ".join(lg.check_new(cfg))
+    assert "vendor/" not in found
+    assert "gen/a_pb.py" not in found
+    assert "walt/loki-test.py" not in found
+    assert "gen/b.py:1" in found
+    assert "walt/loki-test2.py:1" in found
+
+
 def test_a_gitignored_file_is_not_read_and_an_untracked_one_is(repo: Repo) -> None:
     repo.write(".gitignore", "ignored.py\n")
     repo.write("ignored.py", "X_TIMEOUT = 5\n")
@@ -375,10 +546,80 @@ def test_an_extensionless_script_is_read_and_other_files_only_under_text_roots(r
     repo.write("bin/job", "#!/usr/bin/env python3\nRUN_SECONDS = 9\n")
     repo.write("web/app.js", "const POLL_MS = 500;\n")
     repo.write("other/app.js", "const POLL_MS = 500;\n")
+    repo.write("web/page.html", "<script>\n  const REFRESH_MS = 4000;\n  setTimeout(go, 3000);\n"
+               "</script>\n")
+    repo.write("other/page.html", "<script>\n  const REFRESH_MS = 4000;\n</script>\n")
     found = " ".join(lg.check_new(repo.cfg))
     assert "bin/job:2" in found
     assert "web/app.js:1" in found
     assert "other/app.js" not in found
+    assert "web/page.html:2" in found
+    assert "web/page.html:3" in found
+    assert "other/page.html" not in found
+
+
+# -- a file that cannot be read, and a tag that cannot count, are said by every check that reads it
+
+
+def test_a_file_that_does_not_parse_is_said_by_the_new_and_the_tags_checks(repo: Repo) -> None:
+    repo.write("pkg/bad.py", "def (:\n")
+    found = repo.problems()
+    assert any("pkg/bad.py: does not parse" in m for m in found["new"])
+    assert any("pkg/bad.py: does not parse" in m for m in found["tags"])
+    assert found["list"] == []
+
+
+def test_a_file_that_is_not_utf8_is_said_by_the_new_and_the_tags_checks(repo: Repo) -> None:
+    (repo.root / "pkg").mkdir(exist_ok=True)
+    (repo.root / "pkg/latin.py").write_bytes(b"X = 'caf\xe9'\n")
+    (repo.root / "web").mkdir()
+    (repo.root / "web/latin.js").write_bytes(b"// caf\xe9\n")
+    found = repo.problems()
+    for check in ("new", "tags"):
+        for name in ("pkg/latin.py", "web/latin.js"):
+            assert any(f"{name}: is not UTF-8" in m for m in found[check]), (check, name)
+
+
+def test_a_malformed_or_stray_tag_is_said_by_the_new_and_the_tags_checks(repo: Repo) -> None:
+    repo.write("pkg/b.py", "X = foo()  # limit-ok: format — a fine reason here\n"
+               "Y_TIMEOUT = 5  # limit-ok nonsense\n")
+    found = repo.problems()
+    for check in ("new", "tags"):
+        assert any("pkg/b.py:1: a `limit-ok` tag with no limit" in m for m in found[check]), check
+        assert any("pkg/b.py: line 2: a `limit-ok` comment that does not read" in m
+                   for m in found[check]), check
+
+
+def test_two_identical_tags_need_two_registry_lines(repo: Repo) -> None:
+    repo.append("pkg/a.py", f"TAGGED = 998  # {REASON}\n")
+    [message] = only(repo.problems(), "tags")
+    assert "tag not in limitguard-tags.txt (x1)" in message
+    repo.append("tests/limitguard-tags.txt", TAGS)
+    assert repo.problems() == {"new": [], "list": [], "tags": []}
+    repo.write("tests/limitguard-tags.txt", TAGS + TAGS + TAGS)
+    [message] = only(repo.problems(), "tags")
+    assert "line with no matching tag (x1)" in message
+
+
+def test_an_edit_between_two_runs_is_read_not_remembered(repo: Repo) -> None:
+    assert lg.check_new(repo.cfg) == []
+    repo.replace("pkg/a.py", "LISTED = 30", "LISTED = 31")  # the same size, the same path
+    assert [m for m in lg.check_new(repo.cfg) if "LISTED = 31" in m]
+    assert any("stale line" in m and "LISTED = | 30" in m for m in lg.check_list(repo.cfg))
+
+
+def test_no_string_from_source_reaches_a_list_line(repo: Repo) -> None:
+    repo.write("pkg/b.py", "token_ttl = issue('alice@home.example', 30)\n"
+               "PAGE = {'alice limit': 5, b'x': 9, 'max_results': 7}\n"
+               "x = args.get('alice timeout', 25)\n"
+               "y = f(f'{who}@home.example', 3, retries=4)\n")
+    repo.write("web/b.js", "const NAME_MAX = 'alice@home.example' + 30; const A_MAX = \"x + 5;\n")
+    lines = [" | ".join(h.key()) for h in lg.collect(repo.cfg).hits]
+    assert len(lines) >= 6
+    for line in lines:
+        assert not set("\"'`") & set(line.replace(lg.PLACEHOLDER, "")), line
+        assert "alice" not in line and "home.example" not in line, line
+    assert any(lg.PLACEHOLDER in line for line in lines)
 
 
 def test_summary_line_counts_the_list_and_the_tags(repo: Repo) -> None:
@@ -387,6 +628,17 @@ def test_summary_line_counts_the_list_and_the_tags(repo: Repo) -> None:
         "limits not yet converted: 3 (hits 2, hand-found 1); "
         "tags: format 1, maximum 0, not-a-limit 0, reply-bound 0"
     )
+
+
+def test_no_list_line_holds_a_string_from_source() -> None:
+    """The real repository's emitted hits, every todo line (an anchor takes a piece of the line
+    that has no quote in it) and each tags line but its free-text reason."""
+    keys = [" | ".join(h.key()) for h in lg.collect(CONFIG).hits]
+    keys += lg.read_lines(CONFIG.guard_dir / lg.TODO_NAME)
+    tags = lg.read_lines(CONFIG.guard_dir / lg.TAGS_NAME)
+    keys += [" | ".join(ln.split(" | ")[:4]) for ln in tags]
+    for key in keys:
+        assert not set("\"'`") & set(key.replace(lg.PLACEHOLDER, "")), key
 
 
 if __name__ == "__main__":

@@ -9,8 +9,8 @@
 untracked, so a new file is read in the run that gates its commit), minus the skipped paths.
 Python is every `*.py` and every extensionless file whose first line names python; it is read with
 the `ast` module, and a file that does not parse is a problem, never a skip. Other files (the
-household pages' JavaScript, compose, systemd units, shell, Dockerfiles, the Caddyfile) are read by
-pattern, only under `Config.text_roots`.
+household pages' JavaScript and `.html` (its inline script), compose, systemd units, shell,
+Dockerfiles, the Caddyfile) are read by pattern, only under `Config.text_roots`.
 
 **What it flags** (a literal other than 0, 1 and -1; literal arithmetic such as `64 << 20` counts
 as one literal):
@@ -18,6 +18,7 @@ as one literal):
 - any upper-case constant at module or class level, tuple targets paired with their values;
 - any name, keyword or default argument carrying a limit word (`WORDS`), whatever the expression
   around the literal (`deadline = time.monotonic() + 30`, `timeout=httpx.Timeout(20.0)`);
+- a dict literal's key carrying a limit word with a numeric value (`{"max_results": 100}`);
 - `.get("<limit word>", N)`, a literal compared with a limit-worded name or with `len(...)`,
   the limit argument of the calls in `CALL_ARGS` (tuples walked), `range(N)`, a slice bound of 16
   or more.
@@ -30,9 +31,13 @@ The kinds are `KINDS`; `maximum`, `reply-bound` and `not-a-limit` each have a co
 `tag_problem`). Every tag is also a line in `limitguard-tags.txt`, so a new escape is an edit to
 two files and Robert reads the registry in one place.
 
+**No string from source is ever copied into a list.** A hit's value is the expression with every
+string literal replaced by `PLACEHOLDER`, and `what` holds a string only when it is a plain word.
+
 **What is not converted yet** is `limitguard-todo.txt`: a detector hit as `path | scope | what |
 value` (no line number, so an edit elsewhere does not move it) or a hand-found miss as `path |
-anchor`, an anchor being a piece of the line's text. The list is a multiset.
+anchor`, an anchor being a piece of the line's text of at least `MIN_ANCHOR` characters, with no
+` | ` in it. The list is a multiset.
 
 Run `python tests/test_limitguard.py --strict` (or `python -m tests.test_limitguard --strict`
 where `tests/` is a package) to list everything still on the list and exit 1; `--emit` prints
@@ -42,7 +47,9 @@ every unmarked hit as a todo line.
 from __future__ import annotations
 
 import ast
+import copy
 import fnmatch
+import functools
 import hashlib
 import io
 import re
@@ -59,8 +66,9 @@ from typing import Any
 NON_SHIPPING = ("deploy/", "plans/", "spikes/")
 DEFAULT_SKIP = ("tests/", "evals/", *NON_SHIPPING)
 KINDS = ("maximum", "reply-bound", "format", "not-a-limit")
-STRONG = frozenset(
-    "timeout timeouts seconds wall deadline max cap caps bytes retries attempts limit".split()
+STRONG = frozenset(  # `sleep` and `wait` are here so an unnamed `wait_for(x, 30)` is refused too
+    "timeout timeouts seconds wall deadline max cap caps bytes retries attempts limit sleep wait"
+    .split()
 )
 TODO_NAME = "limitguard-todo.txt"
 TAGS_NAME = "limitguard-tags.txt"
@@ -84,7 +92,8 @@ CALL_ARGS: dict[str, tuple[int, ...]] = {
     "ProcessPoolExecutor": (0,), "islice": (1, 2), "timedelta": (0, 1, 2, 3, 4, 5, 6),
     "Timeout": (0, 1, 2, 3), "setrlimit": (1,), "alarm": (0,), "settimeout": (0,),
     "lru_cache": (0,), "deque": (1,), "Queue": (0,), "read": (0,), "read1": (0,), "recv": (0,),
-    "readline": (0,), "fetchmany": (0,), "join": (0,),
+    "readline": (0,), "fetchmany": (0,), "join": (0,), "wait": (0,), "call_later": (0,),
+    "acquire": (0, 1), "result": (0,), "Timer": (0,), "communicate": (1,),
 }  # fmt: skip
 # the calls whose arguments count inside an upper-case constant (a refusal's HTTP status does not)
 TIME_CALLS = frozenset("timedelta Timeout Limits timeout frozenset set tuple dict list".split())
@@ -95,9 +104,35 @@ TAG = re.compile(r"limit-ok:\s*(?P<kind>[A-Za-z-]+)\s*(?:—|--|-|:)\s*(?P<reaso
 TAG_WORD = re.compile(r"limit-ok\b")
 
 
+PLACEHOLDER = '"…"'  # stands for every string literal in a value written to a shipped list
+
+
+class Scrub(ast.NodeTransformer):
+    """A copy of an expression with every string literal replaced by `PLACEHOLDER`, so a string
+    from source (an address, a name) is never copied into a todo or tags line."""
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        if isinstance(node.value, (str, bytes)):
+            return ast.copy_location(ast.Name(id=PLACEHOLDER, ctx=ast.Load()), node)
+        return node
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> ast.AST:
+        return ast.copy_location(ast.Name(id=PLACEHOLDER, ctx=ast.Load()), node)
+
+
+def unparsed(node: ast.AST) -> str:
+    return ast.unparse(Scrub().visit(copy.deepcopy(node)))
+
+
+def label(text: str) -> str:
+    """A string literal's text for a `what` field: itself when it is a plain identifier-like word,
+    else the placeholder."""
+    return text if re.fullmatch(r"[\w.\-]{1,40}", text) else PLACEHOLDER
+
+
 def words(name: str) -> set[str]:
     name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
-    return {w for w in re.split(r"[_\-\s.]+", name.lower()) if w}
+    return {w for w in re.split(r"[^a-z0-9]+", name.lower()) if w}
 
 
 def limitish(name: str | None) -> bool:
@@ -266,7 +301,10 @@ def shorten(text: str) -> str:
     """A value over 160 characters (a schema, a table) keeps its start and a digest of all of it."""
     if len(text) <= 160:
         return text
-    return f"{text[:80]}...#{hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest()[:12]}"
+    head = text[:80]
+    if head.count('"') % 2:  # the cut fell inside a placeholder: drop its opening half
+        head = head[: head.rfind('"')]
+    return f"{head}...#{hashlib.sha1(text.encode(), usedforsecurity=False).hexdigest()[:12]}"
 
 
 def parse_comments(source: str, lines: list[str]) -> tuple[dict[int, Tag], set[int], list[str]]:
@@ -321,7 +359,7 @@ class PyScan(ast.NodeVisitor):
         self.covered.update(id(n) for x in lits for n in ast.walk(x))
         first = (start or span).lineno
         last = getattr(span, "end_lineno", None) or span.lineno
-        text = shorten(re.sub(r"\s+", "", value if isinstance(value, str) else ast.unparse(value)))
+        text = shorten(re.sub(r"\s+", "", value if isinstance(value, str) else unparsed(value)))
         self.hits.append(Hit(self.path, span.lineno, ".".join(self.scope) or "<module>", what, text,
                              name, self.tag_for(first, last)))
 
@@ -389,11 +427,18 @@ class PyScan(ast.NodeVisitor):
                 self.add(node.args[i], literals(node.args[i]), f"{name}(arg {i})", node.args[i], "")
         if name == "range" and any(not trivial(a) for a in node.args):
             lits = [a for a in node.args if not trivial(a)]
-            self.add(node, lits, "range(N)", ",".join(ast.unparse(a) for a in node.args), "")
+            self.add(node, lits, "range(N)", ",".join(unparsed(a) for a in node.args), "")
         if (name == "get" and len(node.args) >= 2 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str) and limitish(node.args[0].value)):
-            self.add(node.args[1], literals(node.args[1]), f".get({node.args[0].value})",
+            self.add(node.args[1], literals(node.args[1]), f".get({label(node.args[0].value)})",
                      node.args[1], node.args[0].value)
+        self.generic_visit(node)
+
+    def visit_Dict(self, node: ast.Dict) -> None:
+        for key, value in zip(node.keys, node.values, strict=True):
+            if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    and limitish(key.value)):
+                self.add(value, literals(value), f"dict key {label(key.value)}", value, key.value)
         self.generic_visit(node)
 
     def visit_Slice(self, node: ast.Slice) -> None:
@@ -453,8 +498,11 @@ CONF_PATTERNS = [
         rf"(?<![\w])(sleep|timeout|--max-time|--connect-timeout|--interval|--start-period|--retries"
         rf"|-m|--retry|limit rate|burst)[ =]+({NUM}[a-z/]*)")),
 ]  # fmt: skip
-TEXT_SUFFIXES = frozenset(".js .mjs .cjs .yml .yaml .service .timer .socket .sh .conf".split())
-JS_SUFFIXES = frozenset({".js", ".mjs", ".cjs"})
+TEXT_SUFFIXES = frozenset(
+    ".js .mjs .cjs .html .yml .yaml .service .timer .socket .sh .conf".split()
+)
+JS_SUFFIXES = frozenset({".js", ".mjs", ".cjs", ".html"})  # a page's inline script is JavaScript
+QUOTED = re.compile(r"""(["'`])(?:\\.|(?!\1).)*\1""")
 TRIVIAL_TEXT = frozenset({"0", "1", "-1"})
 
 
@@ -517,11 +565,18 @@ def text_hits(path: str, text: str, js: bool) -> tuple[list[Hit], list[str]]:
                 tag = tags.get(n) or (tags.get(n - 1) if n - 1 in only else None)
                 if tag:
                     used.add(tag.line)
-                value = shorten(re.sub(r"\s+", "", val))
+                value = shorten(re.sub(r"\s+", "", scrub_text(val)))
                 hits.append(Hit(path, n, "-", f"{kind} {name}".strip(), value, name, tag))
     for n in sorted(set(tags) - used):
         problems.append(f"{path}:{n}: {STRAY}")
     return hits, problems
+
+
+def scrub_text(text: str) -> str:
+    """`text` with every quoted string, and any quote left unclosed, replaced by `PLACEHOLDER`."""
+    marked = QUOTED.sub("\0", text)
+    marked = re.sub(r"[\"'`].*$", "\0", marked)
+    return marked.replace("\0", PLACEHOLDER)
 
 
 def eval_num(expr: str) -> float:
@@ -573,7 +628,7 @@ def collect(cfg: Config) -> Found:
     found = Found()
     for rel in listed(cfg.root):
         p = cfg.root / rel
-        if skipped(rel, cfg) or p.is_symlink() or not p.is_file():
+        if skipped(rel, cfg) or not p.is_file():
             continue
         suffix = p.suffix.lower()
         head = first_line(p) if not suffix else ""
@@ -591,14 +646,25 @@ def collect(cfg: Config) -> Found:
         except UnicodeDecodeError:
             found.problems.append(f"{rel}: is not UTF-8; a file that cannot be read is not skipped")
             continue
+        hits, maxima, problems = scanned(rel, source, python, suffix in JS_SUFFIXES)
         if python:
-            hits, maxima, problems = python_hits(rel, source)
-            found.maxima[rel] = maxima
-        else:
-            hits, problems = text_hits(rel, source, suffix in JS_SUFFIXES)
+            found.maxima[rel] = set(maxima)
         found.hits += hits
         found.problems += problems
     return found
+
+
+@functools.cache
+def scanned(
+    rel: str, source: str, python: bool, js: bool
+) -> tuple[tuple[Hit, ...], frozenset[str], tuple[str, ...]]:
+    """One file's hits, maxima names and problems. Cached on the file's text, so the three checks
+    of one run parse it once, and an edit between two runs in one process is still read."""
+    if python:
+        hits, maxima, problems = python_hits(rel, source)
+        return tuple(hits), frozenset(maxima), tuple(problems)
+    hits, problems = text_hits(rel, source, js)
+    return tuple(hits), frozenset(), tuple(problems)
 
 
 # --------------------------------------------------------------------------------------------
@@ -612,18 +678,29 @@ def read_lines(path: Path) -> list[str]:
             if ln.strip() and not ln.lstrip().startswith("#")]  # fmt: skip
 
 
-def todo_lines(cfg: Config) -> tuple[Counter[tuple[str, ...]], list[tuple[str, str]]]:
-    """The hit lines (a multiset of 4-field keys) and the hand-found anchors (path, anchor)."""
+MIN_ANCHOR = 4
+
+
+def todo_lines(
+    cfg: Config,
+) -> tuple[Counter[tuple[str, ...]], list[tuple[str, str]], list[str]]:
+    """The hit lines (a multiset of 4-field keys), the hand-found anchors (path, anchor), and the
+    lines that are neither: an anchor may not hold ` | `, which would read as a hit line, and
+    must be at least `MIN_ANCHOR` characters."""
     hits: Counter[tuple[str, ...]] = Counter()
     anchors: list[tuple[str, str]] = []
+    bad: list[str] = []
     for line in read_lines(cfg.guard_dir / TODO_NAME):
         parts = line.split(" | ")
         if len(parts) == 4:
             hits[tuple(parts)] += 1
+        elif len(parts) == 2 and len(parts[1]) >= MIN_ANCHOR:
+            anchors.append((parts[0], parts[1]))
         else:
-            path, _, anchor = line.partition(" | ")
-            anchors.append((path, anchor))
-    return hits, anchors
+            bad.append(f"{TODO_NAME}: `{line[:60]}` is neither `path | scope | what | value` nor "
+                       f"`path | anchor` (an anchor of at least {MIN_ANCHOR} characters, with no "
+                       "` | ` in it)")
+    return hits, anchors, bad
 
 
 def tag_lines(cfg: Config) -> Counter[tuple[str, ...]]:
@@ -646,9 +723,10 @@ def tag_problem(hit: Hit, found: Found, cfg: Config) -> str | None:
         return "`maximum` counts only on a name this file passes into a `Limit(...)`'s maxima"
     if tag.kind == "reply-bound" and hit.path not in cfg.reply_bound:
         return "`reply-bound` counts only in a module that reads Q Branch (Config.reply_bound)"
-    if tag.kind == "not-a-limit" and words(hit.name) & STRONG:
-        strong = sorted(words(hit.name) & STRONG)[0]
-        return f"`not-a-limit` is refused on a name carrying `{strong}`"
+    strong_words = (words(hit.name) | words(hit.what)) & STRONG
+    if tag.kind == "not-a-limit" and strong_words:
+        strong = sorted(strong_words)[0]
+        return f"`not-a-limit` is refused on a hit whose name or description carries `{strong}`"
     return None
 
 
@@ -667,7 +745,7 @@ HOW_OUT = (
 def check_new(cfg: Config) -> list[str]:
     """Every hit that is neither accepted by a tag nor on the list: a new limit."""
     found = collect(cfg)
-    listed_hits, _ = todo_lines(cfg)
+    listed_hits, _, _ = todo_lines(cfg)
     left = Counter(listed_hits)
     out = list(found.problems)
     for hit in found.hits:
@@ -683,21 +761,20 @@ def check_new(cfg: Config) -> list[str]:
 def check_list(cfg: Config) -> list[str]:
     """Every line on the list still matches: a converted value must leave it."""
     found = collect(cfg)
-    listed_hits, anchors = todo_lines(cfg)
+    listed_hits, anchors, out = todo_lines(cfg)
     have: Counter[tuple[str, ...]] = Counter(
         h.key() for h in found.hits if not accepted(h, found, cfg))
-    out = []
     for key, n in sorted((listed_hits - have).items()):
         out.append(f"stale line (x{n}) in {TODO_NAME}: {' | '.join(key)}. The value is no longer a "
                    "hit (converted, tagged or moved): delete the line.")
     for path, anchor in anchors:
+        if path.startswith(NON_SHIPPING):
+            out.append(f"{TODO_NAME}: `{path} | {anchor[:40]}` names a path that never ships")
+            continue
         p = cfg.root / path
         if not p.is_file() or anchor not in p.read_text(encoding="utf-8", errors="replace"):
             out.append(f"stale anchor in {TODO_NAME}: {path} | {anchor}. The text is gone from the "
                        "file (converted?): delete the line.")
-    for line in read_lines(cfg.guard_dir / TODO_NAME):
-        if line.startswith(NON_SHIPPING):
-            out.append(f"{TODO_NAME}: `{line[:60]}` names a path that never ships")
     return out
 
 
@@ -720,9 +797,6 @@ def check_tags(cfg: Config) -> list[str]:
     for key, n in sorted((registry - have).items()):
         out.append(f"{TAGS_NAME} line with no matching tag (x{n}): {' | '.join(key)}. Delete it, "
                    "or fix the tag so its kind and reason are the line's.")
-    for line in read_lines(cfg.guard_dir / TAGS_NAME):
-        if line.startswith(NON_SHIPPING):
-            out.append(f"{TAGS_NAME}: `{line[:60]}` names a path that never ships")
     return out
 
 
